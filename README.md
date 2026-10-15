@@ -28,7 +28,7 @@ npx @pradeeppilot/scale-audit ./my-app --fail-on high
 - DB: N+1 queries, unbounded reads (pagination-aware), missing Prisma indexes (per-model, relation/`OR`-safe)
 - Concurrency: in-process session/rate-limit/state, WebSockets without shared adapter, unbounded `Promise.all` over user-sized collections
 - I/O: blocking sync calls in request paths (startup/script calls downgraded), image processing in handlers
-- Resilience: outbound HTTP without timeout/abort signal (shared `axios.create` clients and variable configs handled)
+- Resilience: outbound HTTP without timeout/abort signal (shared `axios.create` clients honored; cancellation-only `signal`s and variable configs reported as low-confidence, since unmount/dispose signals do not bound a hung request)
 - Lifecycle: missing health endpoint, missing graceful shutdown (AST-based, not comment/string matching)
 - Deps: heavy/deprecated packages
 

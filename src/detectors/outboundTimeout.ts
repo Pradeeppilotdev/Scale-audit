@@ -5,6 +5,8 @@ import type { Finding } from "../types.js";
 const AXIOS_METHODS = new Set(["get", "post", "put", "delete", "patch", "head", "options", "request"]);
 // `axios.create({ timeout: ... })` at module scope configures a shared client.
 const SHARED_AXIOS_TIMEOUT = /axios\.create\s*\(\s*\{[\s\S]{0,400}?timeout\s*:/;
+// Only an explicit timer counts as a timeout; a bare AbortController signal is cancellation-only.
+const REAL_TIMEOUT_EXPR = /AbortSignal\.timeout\s*\(/;
 
 export async function detectOutboundTimeouts(root: string): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -27,29 +29,54 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, s
       if (!sharedClientCovers) {
         const check = timeoutCheck(node, target);
         if (check !== "bounded") {
-          const unknown = check === "unknown";
           const ln = lineOf(sf, node);
-          out.push(
-            makeFinding({
-              id: "outbound-no-timeout",
-              category: "Resilience",
-              severity: unknown ? "low" : "medium",
-              confidence: unknown ? "low" : "medium",
-              file: rel,
-              line: ln,
-              message: unknown
-                ? `Outbound HTTP call (${target.name}) uses a config object passed as a variable; could not confirm a timeout/abort signal.`
-                : `Outbound HTTP call (${target.name}) has no timeout/abort signal configured.`,
-              scaleTrigger: "A slow downstream stalls requests and can exhaust sockets/connections under load.",
-              suggestedFix: "Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) }) or axios timeout) and consider retries with backoff.",
-              snippet: snippetAt(content, ln),
-            }),
-          );
+          out.push(buildFinding(check, target.name, content, rel, ln));
         }
       }
     }
   }
   ts.forEachChild(node, (c) => visit(c, sf, content, rel, sharedAxiosTimeout, out));
+}
+
+function buildFinding(check: Exclude<TimeoutCheck, "bounded">, callName: string, content: string, rel: string, ln: number): Finding {
+  const base = {
+    id: "outbound-no-timeout",
+    category: "Resilience" as const,
+    file: rel,
+    line: ln,
+    snippet: snippetAt(content, ln),
+  };
+
+  if (check === "cancellation-only") {
+    return makeFinding({
+      ...base,
+      severity: "low",
+      confidence: "low",
+      message: `Outbound HTTP call (${callName}) has a cancellation signal but no timeout; a hung request is never aborted.`,
+      scaleTrigger: "Cancellation signals only fire on unmount/dispose; a stalled downstream still holds the request open.",
+      suggestedFix: "Add a real timeout: AbortSignal.any([signal, AbortSignal.timeout(5000)]) (or axios timeout).",
+    });
+  }
+
+  if (check === "unknown") {
+    return makeFinding({
+      ...base,
+      severity: "low",
+      confidence: "low",
+      message: `Outbound HTTP call (${callName}) uses a config object passed as a variable; could not confirm a timeout/abort signal.`,
+      scaleTrigger: "A slow downstream stalls requests and can exhaust sockets/connections under load.",
+      suggestedFix: "Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) }) or axios timeout) and consider retries with backoff.",
+    });
+  }
+
+  return makeFinding({
+    ...base,
+    severity: "medium",
+    confidence: "medium",
+    message: `Outbound HTTP call (${callName}) has no timeout/abort signal configured.`,
+    scaleTrigger: "A slow downstream stalls requests and can exhaust sockets/connections under load.",
+    suggestedFix: "Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) }) or axios timeout) and consider retries with backoff.",
+  });
 }
 
 function calleeInfo(expr: ts.Expression): { name: string; kind: "fetch" | "axios" | "http" } | null {
@@ -64,7 +91,7 @@ function calleeInfo(expr: ts.Expression): { name: string; kind: "fetch" | "axios
   return null;
 }
 
-type TimeoutCheck = "bounded" | "unbounded" | "unknown";
+type TimeoutCheck = "bounded" | "unbounded" | "unknown" | "cancellation-only";
 
 function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fetch" | "axios" | "http" }): TimeoutCheck {
   const args = node.arguments;
@@ -84,7 +111,7 @@ function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fe
   if (!config) return "unbounded";
 
   const obj = asObject(config);
-  if (obj) return hasTimeoutOrSignal(obj) ? "bounded" : "unbounded";
+  if (obj) return objectTimeoutVerdict(obj);
 
   // String-literal argument in the config position is a URL (http.request("...")).
   if (ts.isStringLiteral(config) || ts.isNoSubstitutionTemplateLiteral(config) || ts.isTemplateExpression(config)) {
@@ -95,6 +122,24 @@ function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fe
   return "unknown";
 }
 
+function objectTimeoutVerdict(config: ts.ObjectLiteralExpression): Exclude<TimeoutCheck, "unknown"> {
+  let hasRealTimeout = false;
+  let hasSignal = false;
+  for (const p of config.properties) {
+    if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) continue;
+    const name = p.name.getText().replace(/['"]/g, "");
+    if (name === "timeout" || name === "timeoutMs") hasRealTimeout = true;
+    if (name === "signal") {
+      hasSignal = true;
+      const valueText = ts.isPropertyAssignment(p) ? p.initializer.getText() : p.name.getText();
+      if (REAL_TIMEOUT_EXPR.test(valueText)) hasRealTimeout = true;
+    }
+  }
+  if (hasRealTimeout) return "bounded";
+  if (hasSignal) return "cancellation-only";
+  return "unbounded";
+}
+
 function asObject(arg: ts.Expression | undefined): ts.ObjectLiteralExpression | null {
   if (!arg) return null;
   let val = arg;
@@ -102,12 +147,4 @@ function asObject(arg: ts.Expression | undefined): ts.ObjectLiteralExpression | 
     val = (val as any).expression;
   }
   return ts.isObjectLiteralExpression(val) ? val : null;
-}
-
-function hasTimeoutOrSignal(config: ts.ObjectLiteralExpression): boolean {
-  return config.properties.some((p) => {
-    if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) return false;
-    const name = p.name.getText().replace(/['"]/g, "");
-    return name === "timeout" || name === "signal" || name === "timeoutMs";
-  });
 }

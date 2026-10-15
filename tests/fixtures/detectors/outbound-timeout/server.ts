@@ -24,3 +24,13 @@ export async function withTimeoutAxios(url: string) {
 export async function variableConfig(url: string, opts: RequestInit) {
   return fetch(url, opts);
 }
+
+// Cancellation signal only (no timer): low-confidence finding.
+export async function cancellationOnly(url: string, ctrl: AbortController) {
+  return fetch(url, { signal: ctrl.signal });
+}
+
+// Cancellation + real timeout: bounded.
+export async function anyTimeout(url: string, ctrl: AbortController) {
+  return fetch(url, { signal: AbortSignal.any([ctrl.signal, AbortSignal.timeout(3000)]) });
+}

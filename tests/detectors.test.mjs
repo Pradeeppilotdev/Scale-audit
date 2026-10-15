@@ -60,14 +60,21 @@ test("sync-io marks request-path high, scripts and startup low", async () => {
   assert.match(startup.message, /module scope/);
 });
 
-test("outbound timeouts: flags missing config, downgrades variables, honors shared axios client", async () => {
+test("outbound timeouts: real timers bounded, cancellation-only and variables downgraded", async () => {
   const findings = await detectOutboundTimeouts(fixture("outbound-timeout"));
-  const files = findings.map((f) => `${f.file}:${f.confidence}`);
-  assert.equal(findings.length, 3, JSON.stringify(files));
+  const files = findings.map((f) => `${f.file}:${f.line}:${f.severity}/${f.confidence}`);
+  assert.equal(findings.length, 4, JSON.stringify(files));
   assert.ok(!findings.some((f) => f.file.includes("shared")), "shared axios client must be honored");
+  assert.ok(!findings.some((f) => f.snippet.includes("anyTimeout")), "AbortSignal.any with timeout must be bounded");
+  assert.ok(!findings.some((f) => f.snippet.includes("withTimeoutFetch")), "AbortSignal.timeout must be bounded");
+
   const low = findings.filter((f) => f.confidence === "low");
-  assert.equal(low.length, 1, "variable config must be low confidence");
-  assert.match(low[0].message, /could not confirm/);
+  assert.equal(low.length, 2, JSON.stringify(files));
+  assert.ok(low.some((f) => /cancellation signal but no timeout/.test(f.message)), "expected cancellation-only finding");
+  assert.ok(low.some((f) => /could not confirm/.test(f.message)), "expected variable-config finding");
+
+  const medium = findings.filter((f) => f.severity === "medium");
+  assert.equal(medium.length, 2, "inline configs without any signal must stay medium");
 });
 
 test("unbounded concurrency flags Promise.all over unbounded maps", async () => {
