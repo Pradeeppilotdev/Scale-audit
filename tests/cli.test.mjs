@@ -45,3 +45,14 @@ test("--verify patches unbounded reads in an isolated copy and reports per-file 
   const after = JSON.parse(original.stdout);
   assert.ok(after.findings.some((f) => f.id === "unbounded-read"), "fixture should still have unbounded reads");
 });
+
+test("score is family-capped so one repeated issue class does not zero it out", () => {
+  const scoring = path.join(root, "tests", "fixtures", "scoring");
+  const r = spawnSync(process.execPath, [cli, scoring], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  assert.equal(report.findings.length, 12, "expected 12 sync-io findings");
+  assert.ok(report.findings.every((f) => f.id === "sync-io"));
+  // 12 high-severity findings = 120 raw penalty, capped at 20 for the family -> 80.
+  assert.equal(report.score, 80);
+});

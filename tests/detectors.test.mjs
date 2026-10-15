@@ -20,21 +20,26 @@ test("n-plus-one flags awaited ORM call inside a loop", async () => {
   assert.equal(findings.filter((f) => f.id === "n-plus-one").length, 1);
 });
 
-test("unbounded reads: flags real gaps, ignores array helpers and options-object limits", async () => {
+test("unbounded reads: flags real gaps, ignores array helpers, options-object limits and GraphQL clients", async () => {
   const findings = await detectUnboundedReads(fixture("unbounded"));
   const sites = findings.map((f) => `${f.line}:${f.confidence}`);
-  // unboundedDefault, unboundedWhere (high) + variableQuery (low confidence).
-  // chained limit, mongoose 3rd-arg options, and array .find must NOT be flagged.
-  assert.equal(findings.length, 3, `expected 3 findings, got ${findings.length} at ${sites.join(", ")}`);
+  // unboundedDefault, unboundedWhere, rawSqlQuery (high) + variableQuery (low).
+  // chained limit, mongoose 3rd-arg options, array .find and Apollo client.query must NOT be flagged.
+  assert.equal(findings.length, 4, `expected 4 findings, got ${findings.length} at ${sites.join(", ")}`);
+  assert.ok(!findings.some((f) => f.snippet.includes("graphqlQuery")), "Apollo client.query must not be flagged");
+  assert.ok(findings.some((f) => f.snippet.includes("rawSqlQuery")), "pg-style client.query must be flagged");
   const low = findings.filter((f) => f.confidence === "low");
   assert.equal(low.length, 1, "variable query must be low confidence");
   assert.match(low[0].message, /could not be confirmed/);
 });
 
-test("missing-index is scoped per model and honors @unique", async () => {
+test("missing-index is scoped per project schema and honors @unique", async () => {
   const findings = await detectMissingIndexes(fixture("missing-index"));
   assert.equal(findings.length, 1, JSON.stringify(findings.map((f) => f.message)));
   assert.match(findings[0].message, /"name"/);
+  // The scoped project marks clerkId @unique in its own schema: no false positive.
+  assert.ok(!findings.some((f) => /clerkId/.test(f.message)), "scoped schema must not leak across projects");
+  assert.ok(!findings.some((f) => f.file.includes("scoped")), "scoped project must use its own schema");
 });
 
 test("in-process state flags session/rate-limit only when store is absent", async () => {

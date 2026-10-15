@@ -107,7 +107,7 @@ const STRONG_ORM_METHODS = new Set([
 
 const AMBIGUOUS_ORM_METHODS = new Set(["find", "findOne", "findFirst", "query", "execute", "select"]);
 
-const DB_RECEIVER = /(^|\.)(prisma|db|database|client|repository|repo|manager|connection|knex|mongoose|sequelize|orm)(\.|$)/i;
+const DB_RECEIVER = /(^|\.)(prisma|db|database|knex|mongoose|sequelize|orm|connection|manager|(\w+)?repo(sitory)?)(\.|$)/i;
 
 export function isOrmCall(node: ts.CallExpression): boolean {
   if (!ts.isPropertyAccessExpression(node.expression)) return false;
@@ -120,6 +120,23 @@ export function isOrmCall(node: ts.CallExpression): boolean {
   if (first && (ts.isArrowFunction(first) || ts.isFunctionExpression(first))) return false;
 
   const receiver = node.expression.expression.getText();
+
+  // Bare `client` is ambiguous (Apollo/SDK clients vs node-postgres).
+  // Only treat as a DB call when it looks like raw SQL: client.query("...") or
+  // client.query({ text: "..." }) — not client.query({ query: gql`...` }).
+  if (/(^|\.)client$/.test(receiver)) {
+    if (!first) return false;
+    if (ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first) || ts.isTemplateExpression(first)) return true;
+    const obj = asObjectLiteral(first);
+    return Boolean(
+      obj &&
+        obj.properties.some(
+          (p) =>
+            (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && p.name.getText().replace(/['"]/g, "") === "text",
+        ),
+    );
+  }
+
   if (DB_RECEIVER.test(receiver)) return true;
 
   // Mongoose/TypeORM style static model calls (User.find, User.findOne).
@@ -127,4 +144,12 @@ export function isOrmCall(node: ts.CallExpression): boolean {
   if (/^[A-Z][A-Za-z0-9_]*$/.test(receiver)) return true;
 
   return false;
+}
+
+function asObjectLiteral(expr: ts.Expression): ts.ObjectLiteralExpression | null {
+  let val = expr;
+  while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val) || ts.isNonNullExpression(val)) {
+    val = (val as any).expression;
+  }
+  return ts.isObjectLiteralExpression(val) ? val : null;
 }

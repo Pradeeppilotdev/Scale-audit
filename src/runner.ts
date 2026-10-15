@@ -19,6 +19,26 @@ const SEVERITY_WEIGHT: Record<Finding["severity"], number> = {
   info: 0,
 };
 
+// One repeated issue class (e.g. 100 unbounded reads) should not dominate the score.
+// Each detector family contributes at most this many penalty points.
+const FAMILY_PENALTY_CAP = 20;
+
+/**
+ * Family-capped scoring: findings are grouped by detector id, each family's penalty is
+ * capped, low-confidence findings count half, and the total is subtracted from 100.
+ * This keeps the score comparable between a 70-file app and a 700-file monorepo.
+ */
+export function computeScore(findings: Finding[]): number {
+  const byFamily = new Map<string, number>();
+  for (const f of findings) {
+    const weight = SEVERITY_WEIGHT[f.severity] * (f.confidence === "low" ? 0.5 : 1);
+    byFamily.set(f.id, (byFamily.get(f.id) ?? 0) + weight);
+  }
+  let penalty = 0;
+  for (const familyPenalty of byFamily.values()) penalty += Math.min(familyPenalty, FAMILY_PENALTY_CAP);
+  return Math.max(0, Math.min(100, Math.round(100 - penalty)));
+}
+
 export interface AuditOptions { verifyFixes?: boolean; }
 
 export async function runAudit(input: string, options: AuditOptions = {}): Promise<Report> {
@@ -49,7 +69,7 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
 
     findings.sort((a, b) => SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity]);
 
-    const score = Math.max(0, Math.min(100, 100 - findings.reduce((s, f) => s + SEVERITY_WEIGHT[f.severity], 0)));
+    const score = computeScore(findings);
 
     let firstBottleneck: Finding | null = null;
     const order: Finding["severity"][] = ["critical", "high", "medium", "low"];

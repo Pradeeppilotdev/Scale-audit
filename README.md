@@ -25,7 +25,7 @@ npx @pradeeppilot/scale-audit ./my-app --fail-on high
 ```
 
 ## Detectors (v0.3)
-- DB: N+1 queries, unbounded reads (pagination-aware), missing Prisma indexes (per-model, relation/`OR`-safe)
+- DB: N+1 queries, unbounded reads (pagination-aware; raw SQL and TypeORM repository calls included), missing Prisma indexes (scoped to each project's own schema, relation/`OR`-safe)
 - Concurrency: in-process session/rate-limit/state, WebSockets without shared adapter, unbounded `Promise.all` over user-sized collections
 - I/O: blocking sync calls in request paths (startup/script calls downgraded), image processing in handlers
 - Resilience: outbound HTTP without timeout/abort signal (shared `axios.create` clients honored; cancellation-only `signal`s and variable configs reported as low-confidence, since unmount/dispose signals do not bound a hung request)
@@ -35,6 +35,11 @@ npx @pradeeppilot/scale-audit ./my-app --fail-on high
 Precision notes:
 - Findings carry `confidence`; ambiguous cases (query/config passed as a variable) are reported as `low` instead of asserted.
 - `--verify` only auto-patches unambiguous `findMany`/`findAll` calls and reports per-file validity.
+- GraphQL/SDK clients (`client.query({ query })`) are not mistaken for DB reads; only raw-SQL shapes (`client.query("...")`, `{ text: "..." }`) are.
+
+## Score
+
+Starts at 100, subtracts weighted findings, but **each detector family (issue class) contributes at most 20 points** and low-confidence findings count half. One repeated issue can't pin a large repo at 0, so scores stay comparable across repo sizes.
 
 Requires Node.js 20+.
 

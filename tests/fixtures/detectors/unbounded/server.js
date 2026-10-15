@@ -40,6 +40,18 @@ function localLookup(users) {
   return Users.find((u) => u.id === 1);
 }
 
+const client = { query: async (q) => q };
+
+// Apollo/GraphQL client: NOT a DB read.
+function graphqlQuery() {
+  return client.query({ query: "query { feed { id } }" });
+}
+
+// node-postgres style raw SQL: IS a DB read.
+function rawSqlQuery() {
+  return client.query("SELECT * FROM users");
+}
+
 module.exports = {
   unboundedDefault,
   unboundedWhere,
@@ -49,4 +61,6 @@ module.exports = {
   chainedLimit,
   mongooseOptions,
   localLookup,
+  graphqlQuery,
+  rawSqlQuery,
 };
