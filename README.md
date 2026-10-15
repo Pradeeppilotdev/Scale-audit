@@ -1,8 +1,43 @@
 # scale-audit
 
-Static scale-readiness audit for **public Node.js/TypeScript repos**. Clones read-only, infers likely bottlenecks, and reports evidence-backed fixes.
+**Find what breaks your Node.js/TypeScript app under load — before your users do.**
 
-Published: `@pradeeppilot/scale-audit`
+Static, read-only audit for public repos: flags N+1 queries, unbounded reads, missing DB indexes, missing timeouts, blocking I/O, and lifecycle gaps. No code execution, no runtime agent — point it at a repo, or run it on every PR.
+
+[![npm version](https://img.shields.io/npm/v/@pradeeppilot/scale-audit)](https://www.npmjs.com/package/@pradeeppilot/scale-audit)
+[![ci](https://github.com/Pradeeppilotdev/Scale-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Pradeeppilotdev/Scale-audit/actions/workflows/ci.yml)
+[![Node >= 20](https://img.shields.io/node/v/@pradeeppilot/scale-audit)](https://www.npmjs.com/package/@pradeeppilot/scale-audit)
+[![license](https://img.shields.io/npm/l/@pradeeppilot/scale-audit)](https://github.com/Pradeeppilotdev/Scale-audit/blob/main/LICENSE)
+
+```bash
+npx @pradeeppilot/scale-audit https://github.com/owner/repo --format md
+```
+
+Trimmed output from a real Next.js app (23 findings):
+
+```text
+# Scale-Readiness Report
+
+- Framework: Next.js
+- Source files: 69
+
+## Verdict
+
+**Scale score: 80/100**
+
+First bottleneck: **Resilience** — Outbound HTTP call (fetch) has no timeout/abort signal configured.
+- Evidence: `app/page.tsx:9`
+- Fix: Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) })) and consider retries with backoff.
+
+## Top findings (5)
+
+1. [medium] Outbound HTTP call (fetch) has no timeout/abort signal configured.
+   - Location: `app/page.tsx:9`
+2. [medium] Outbound HTTP call (fetch) has no timeout/abort signal configured.
+   - Location: `app/roles/page.tsx:165`
+3. [low] Outbound HTTP call (fetch) has a cancellation signal but no timeout; a hung request is never aborted.
+   - Location: `lib/mplads-api.ts:65`
+```
 
 ## Usage
 
