@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_USERNAME/scale-audit.git"
+    "url": "https://github.com/Pradeeppilotdev/Scale-audit.git"
   },
   "bin": {
     "scale-audit": "dist/cli.js"
