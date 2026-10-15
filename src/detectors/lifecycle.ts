@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { listSourceFiles, readFileSafe, snippetAt, makeFinding } from "./common.js";
+import ts from "typescript";
+import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 
-const HEALTH_ROUTE = /["'`]\/(health|healthz|live|ready|readiness)["'`]/i;
-const LISTEN_CALL = /(\bapp\.listen\s*\(|\bcreateServer\s*\(|\.listen\s*\()/;
-const SHUTDOWN_HANDLER = /process\.(on|once)\s*\(\s*["'`](SIGTERM|SIGINT)["'`]|enableShutdownHooks/;
+const HEALTH_PATH = /^\/(?:api\/)?(health|healthz|live|ready|readiness)(?:\/|$)/i;
+const ROUTE_METHODS = new Set(["get", "post", "put", "patch", "delete", "all", "use", "route", "head", "options"]);
 
 export async function detectLifecycle(root: string): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -23,16 +23,14 @@ export async function detectLifecycle(root: string): Promise<Finding[]> {
   for (const rel of files) {
     const content = await readFileSafe(root, rel);
     if (!content) continue;
-    if (HEALTH_ROUTE.test(content)) hasHealthRoute = true;
-    if (SHUTDOWN_HANDLER.test(content)) hasShutdownHandler = true;
+    const sf = parseSource(rel, content);
+    if (!sf) continue;
+
+    if (!hasHealthRoute && fileHasHealthRoute(sf)) hasHealthRoute = true;
+    if (!hasShutdownHandler && fileHasShutdownHandler(sf)) hasShutdownHandler = true;
     if (!serverFile) {
-      const lines = content.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        if (LISTEN_CALL.test(lines[i])) {
-          serverFile = { rel, content, line: i + 1 };
-          break;
-        }
-      }
+      const listen = findListenCall(sf);
+      if (listen) serverFile = { rel, content, line: listen };
     }
   }
 
@@ -71,4 +69,95 @@ export async function detectLifecycle(root: string): Promise<Finding[]> {
   }
 
   return out;
+}
+
+/** `.listen(...)` on an app/server, or `createServer(...)`. */
+function findListenCall(sf: ts.SourceFile): number | null {
+  let line: number | null = null;
+  function visit(node: ts.Node) {
+    if (line) return;
+    if (ts.isCallExpression(node)) {
+      const expr = node.expression;
+      if (ts.isPropertyAccessExpression(expr) && expr.name.getText() === "listen") {
+        line = lineOf(sf, node);
+        return;
+      }
+      if (ts.isIdentifier(expr) && (expr.text === "createServer" || expr.text === "createHttpsServer")) {
+        line = lineOf(sf, node);
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sf);
+  return line;
+}
+
+/** Route registration like app.get("/health", ...) or NestJS @Get("health"). */
+function fileHasHealthRoute(sf: ts.SourceFile): boolean {
+  let found = false;
+  function checkPathArg(node: ts.CallExpression): boolean {
+    const first = node.arguments[0];
+    return Boolean(first && isPathLiteral(first) && HEALTH_PATH.test(pathText(first)));
+  }
+  function visit(node: ts.Node) {
+    if (found) return;
+    if (ts.isCallExpression(node)) {
+      const expr = node.expression;
+      if (ts.isPropertyAccessExpression(expr) && ROUTE_METHODS.has(expr.name.getText()) && checkPathArg(node)) {
+        found = true;
+        return;
+      }
+      // NestJS decorators: @Get("health"), @Controller("health")
+      if (ts.isIdentifier(expr) && /^(Get|Head|All)$/.test(expr.text) && checkPathArg(node)) {
+        found = true;
+        return;
+      }
+      if (ts.isIdentifier(expr) && expr.text === "Controller" && checkPathArg(node)) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sf);
+  return found;
+}
+
+/** process.on("SIGTERM"|"SIGINT", ...) or NestJS enableShutdownHooks(). */
+function fileHasShutdownHandler(sf: ts.SourceFile): boolean {
+  let found = false;
+  function visit(node: ts.Node) {
+    if (found) return;
+    if (ts.isCallExpression(node)) {
+      const expr = node.expression;
+      const calleeText = expr.getText();
+      if (/^process\.(on|once)$/.test(calleeText)) {
+        const first = node.arguments[0];
+        if (first && isPathLiteral(first) && /^(SIGTERM|SIGINT)$/.test(pathText(first))) {
+          found = true;
+          return;
+        }
+      }
+      if (ts.isIdentifier(expr) && expr.text === "enableShutdownHooks") {
+        found = true;
+        return;
+      }
+      if (ts.isPropertyAccessExpression(expr) && expr.name.getText() === "enableShutdownHooks") {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sf);
+  return found;
+}
+
+function isPathLiteral(node: ts.Expression): boolean {
+  return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node);
+}
+
+function pathText(node: ts.Expression): string {
+  return node.getText().replace(/^["'`]|["'`]$/g, "");
 }

@@ -1,6 +1,6 @@
 {
   "name": "@pradeeppilot/scale-audit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Static scale-readiness audit for public Node.js/TypeScript repos. Clones a repo (read-only) and reports what will break as traffic/users grow.",
   "type": "module",
   "license": "MIT",
@@ -31,7 +31,7 @@
     "test": "npm run build && node --test tests/*.mjs"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
     "glob": "^11.1.0",

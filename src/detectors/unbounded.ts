@@ -22,17 +22,21 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, o
   if (ts.isCallExpression(node) && isOrmCall(node)) {
     const methodName = methodNameOf(node.expression);
     if (!UNIQUE_METHODS.has(methodName)) {
-      if (!hasPagination(node)) {
+      const check = paginationCheck(node);
+      if (check !== "bounded") {
+        const unknown = check === "unknown";
         const ln = lineOf(sf, node);
         out.push(
           makeFinding({
             id: "unbounded-read",
             category: "DB",
-            severity: "high",
-            confidence: "medium",
+            severity: unknown ? "medium" : "high",
+            confidence: unknown ? "low" : "medium",
             file: rel,
             line: ln,
-            message: `Database read "${methodName}" appears to have no pagination (take/limit/cursor/skip).`,
+            message: unknown
+              ? `Database read "${methodName}" could not be confirmed as paginated (query passed as a variable); verify take/limit/cursor is set.`
+              : `Database read "${methodName}" appears to have no pagination (take/limit/cursor/skip).`,
             scaleTrigger: "Returns the full table/collection; memory and latency grow with data size.",
             suggestedFix: "Add bounded pagination (take + cursor/skip) with a sensible default cap and enforce max page size.",
             snippet: snippetAt(content, ln),
@@ -50,22 +54,41 @@ function methodNameOf(expr: ts.Expression): string {
   return "";
 }
 
-function hasPagination(node: ts.CallExpression): boolean {
-  if (hasChainedPagination(node)) return true;
-  if (node.arguments.length === 0) return false;
-  const arg = node.arguments[0];
-  // for SQL query strings, can't tell
-  if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) || ts.isTemplateExpression(arg)) {
-    // crude: check for LIMIT in template string
-    const text = arg.getText();
-    return /limit/i.test(text);
-  }
-  if (!ts.isObjectLiteralExpression(arg)) return false;
-  return arg.properties.some((p) => {
-    if (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) {
-      const name = p.name.getText().replace(/['"]/g, "");
-      return PAGINATION_KEYS.has(name);
+type PaginationCheck = "bounded" | "unbounded" | "unknown";
+
+function paginationCheck(node: ts.CallExpression): PaginationCheck {
+  if (hasChainedPagination(node)) return "bounded";
+  if (node.arguments.length === 0) return "unbounded";
+
+  let sawObject = false;
+  let sawScalarString = false;
+  let sawUnverifiable = false;
+
+  // Inspect every argument: Mongoose puts options in the 3rd arg, Prisma in the 1st.
+  for (const arg of node.arguments) {
+    if (ts.isObjectLiteralExpression(arg)) {
+      sawObject = true;
+      const hasKey = arg.properties.some((p) => {
+        if (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) {
+          const name = p.name.getText().replace(/['"]/g, "");
+          return PAGINATION_KEYS.has(name);
+        }
+        return false;
+      });
+      if (hasKey) return "bounded";
+    } else if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) || ts.isTemplateExpression(arg)) {
+      sawScalarString = true;
+      if (/limit/i.test(arg.getText())) return "bounded";
+    } else {
+      sawUnverifiable = true;
     }
-    return false;
-  });
+  }
+
+  // Object args with no pagination key -> confidently unbounded.
+  if (sawObject) return "unbounded";
+  // Only opaque variables/spreads -> can't tell, do not assert unbounded.
+  if (sawUnverifiable) return "unknown";
+  // Only string/SQL arguments without LIMIT -> unbounded.
+  if (sawScalarString) return "unbounded";
+  return "unbounded";
 }

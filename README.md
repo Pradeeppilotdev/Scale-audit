@@ -24,20 +24,32 @@ npx @pradeeppilot/scale-audit ./my-app --verify
 npx @pradeeppilot/scale-audit ./my-app --fail-on high
 ```
 
-## Detectors (v0.2)
-- DB: N+1 queries, unbounded reads, missing Prisma indexes
-- Concurrency: in-process session/rate-limit/state, WebSockets without shared adapter, unbounded `Promise.all` over maps
-- I/O: blocking sync calls in request paths, image processing in handlers
-- Resilience: outbound HTTP without timeout/abort signal
-- Lifecycle: missing health endpoint, missing graceful shutdown
+## Detectors (v0.3)
+- DB: N+1 queries, unbounded reads (pagination-aware), missing Prisma indexes (per-model, relation/`OR`-safe)
+- Concurrency: in-process session/rate-limit/state, WebSockets without shared adapter, unbounded `Promise.all` over user-sized collections
+- I/O: blocking sync calls in request paths (startup/script calls downgraded), image processing in handlers
+- Resilience: outbound HTTP without timeout/abort signal (shared `axios.create` clients and variable configs handled)
+- Lifecycle: missing health endpoint, missing graceful shutdown (AST-based, not comment/string matching)
 - Deps: heavy/deprecated packages
 
-## Local web UI (M2 preview)
+Precision notes:
+- Findings carry `confidence`; ambiguous cases (query/config passed as a variable) are reported as `low` instead of asserted.
+- `--verify` only auto-patches unambiguous `findMany`/`findAll` calls and reports per-file validity.
+
+Requires Node.js 20+.
+
+## Local web UI (deferred preview)
+
+The web UI/backend is **not the current focus** (npm CLI ships first; hosting + DB come later). A minimal preview still ships for local use:
+
 ```bash
 npm run build
-npm run serve          # http://localhost:8787
+npm run serve          # http://127.0.0.1:8787
 ```
-Paste a repo URL, get a polled job and a shareable HTML report at `/report/<id>`. Jobs are in-memory and analysis runs in-process (v0); a real queue/DB is the next milestone.
+
+- Production-safe defaults: binds `127.0.0.1`, accepts **public github.com URLs only**, caps in-memory jobs, rejects symlinked/size-limit-exceeding files.
+- For local development on a local folder: `SCALE_AUDIT_ALLOW_LOCAL=1 npm run serve`.
+- Jobs are in-memory and analysis runs in-process; a real queue/DB/worker is the next milestone.
 
 ## GitHub Action (PR comment)
 ```yaml
@@ -51,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Pradeeppilotdev/Scale-audit/.github/actions/scale-audit@main
         with:
-          fail-on: critical
+          fail-on: high
 ```
 
 ## Safety

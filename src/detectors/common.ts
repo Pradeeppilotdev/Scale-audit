@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, lstat } from "node:fs/promises";
 import path from "node:path";
 import { glob } from "glob";
 import ts from "typescript";
@@ -27,13 +27,17 @@ export async function listSourceFiles(root: string): Promise<string[]> {
     ],
     nodir: true,
     absolute: false,
+    follow: false,
   });
-  return files.sort();
+  return files.sort().slice(0, 20_000);
 }
 
 export async function readFileSafe(root: string, rel: string): Promise<string | null> {
   try {
-    return await readFile(path.join(root, rel), "utf8");
+    const full = path.join(root, rel);
+    const st = await lstat(full);
+    if (st.isSymbolicLink() || st.size > 1_000_000) return null;
+    return await readFile(full, "utf8");
   } catch {
     return null;
   }
@@ -82,38 +86,36 @@ export function hasChainedPagination(node: ts.CallExpression): boolean {
   return false;
 }
 
-export const ORM_CALL_NAMES = new Set([
-  "find",
-  "findOne",
+const STRONG_ORM_METHODS = new Set([
   "findMany",
   "findAll",
   "findUnique",
-  "findFirst",
+  "findUniqueOrThrow",
+  "findFirstOrThrow",
   "findByPk",
-  "query",
-  "execute",
-  "select",
   "aggregate",
 ]);
 
+const AMBIGUOUS_ORM_METHODS = new Set(["find", "findOne", "findFirst", "query", "execute", "select"]);
+
+const DB_RECEIVER = /(^|\.)(prisma|db|database|client|repository|repo|manager|connection|knex|mongoose|sequelize|orm)(\.|$)/i;
+
 export function isOrmCall(node: ts.CallExpression): boolean {
-  if (ts.isPropertyAccessExpression(node.expression)) {
-    const methodName = node.expression.name.getText();
-    if (!ORM_CALL_NAMES.has(methodName)) return false;
-    // Strong ORM-only method names that are rarely array helpers.
-    if (["findMany", "findAll", "findUnique", "findUniqueOrThrow", "findFirst", "findByPk", "aggregate", "query", "execute", "select"].includes(methodName)) {
-      return true;
-    }
-    // Ambiguous names (find, findOne): require a DB-ish receiver.
-    const receiver = node.expression.expression.getText();
-    const lower = receiver.toLowerCase();
-    if (/(prisma|db|repository|repo|manager|connection|collection|store|knex|mongoose|sequelize|em|orm|client)/.test(lower)) return true;
-    if (/^[A-Z]/.test(receiver)) return true; // Model.find (Mongoose/TypeORM static)
-    return false;
-  }
-  if (ts.isIdentifier(node.expression)) {
-    // standalone query helpers are only considered if name is clearly a query function
-    return /^(query|execute|select)$/i.test(node.expression.text);
-  }
+  if (!ts.isPropertyAccessExpression(node.expression)) return false;
+  const methodName = node.expression.name.getText();
+  if (STRONG_ORM_METHODS.has(methodName)) return true;
+  if (!AMBIGUOUS_ORM_METHODS.has(methodName)) return false;
+
+  // Array helpers take a callback as first argument; ORM reads never do.
+  const first = node.arguments[0];
+  if (first && (ts.isArrowFunction(first) || ts.isFunctionExpression(first))) return false;
+
+  const receiver = node.expression.expression.getText();
+  if (DB_RECEIVER.test(receiver)) return true;
+
+  // Mongoose/TypeORM style static model calls (User.find, User.findOne).
+  // Excluded for array helpers by the callback check above.
+  if (/^[A-Z][A-Za-z0-9_]*$/.test(receiver)) return true;
+
   return false;
 }

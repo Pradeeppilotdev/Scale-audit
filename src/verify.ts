@@ -20,11 +20,11 @@ export async function verifyFindings(root: string, findings: Finding[]): Promise
     const autoFindings = findings.filter((f) => AUTO_IDS.has(f.id));
     const manualFindings = findings.filter((f) => !AUTO_IDS.has(f.id));
 
-    // Baseline count for targeted files (unpatched).
+    // Baseline count before patching.
     const baseline = await detectUnboundedReads(work);
     const baselineByFile = countByFile(baseline);
 
-    // Apply patches per file for all auto findings.
+    // Group findings per file and apply patches line-by-line.
     const byFile = new Map<string, Finding[]>();
     for (const f of autoFindings) {
       const arr = byFile.get(f.file) ?? [];
@@ -32,7 +32,7 @@ export async function verifyFindings(root: string, findings: Finding[]): Promise
       byFile.set(f.file, arr);
     }
 
-    let patchedAny = false;
+    const patchedFiles = new Set<string>();
     for (const [rel, fs] of byFile) {
       const full = path.join(work, rel);
       let content: string;
@@ -41,32 +41,34 @@ export async function verifyFindings(root: string, findings: Finding[]): Promise
       const patched = patchUnboundedFile(content, uniqueLines);
       if (patched !== content) {
         writeFileSync(full, patched, "utf8");
-        patchedAny = true;
+        patchedFiles.add(rel);
       }
     }
 
-    const after = patchedAny ? await detectUnboundedReads(work) : baseline;
+    const after = patchedFiles.size > 0 ? await detectUnboundedReads(work) : baseline;
     const afterByFile = countByFile(after);
 
-    const totalBaseline = baselineByFile.size === 0 ? 0 : [...baselineByFile.values()].reduce((a, b) => a + b, 0);
+    const totalBaseline = [...baselineByFile.values()].reduce((a, b) => a + b, 0);
     const totalAfter = [...afterByFile.values()].reduce((a, b) => a + b, 0);
-    const removed = Math.max(0, totalBaseline - totalAfter);
-    const validityPct = autoFindings.length > 0
-      ? Math.round((removed / autoFindings.length) * 100)
-      : null;
 
     for (const f of autoFindings) {
+      const patched = patchedFiles.has(f.file);
+      const before = baselineByFile.get(f.file) ?? 0;
+      const remaining = afterByFile.get(f.file) ?? 0;
+      const removed = Math.max(0, before - remaining);
+      // Validity is computed against this file only, so one bad patch cannot hide behind another file.
+      const validity = patched ? (before > 0 ? Math.round((removed / before) * 100) : 0) : null;
       results.push({
         file: f.file,
         line: f.line,
         findingId: f.id,
         category: "auto",
-        patchApplied: patchedAny,
-        validity: validityPct,
+        patchApplied: patched,
+        validity,
         method: "patch+rescan",
-        detail: patchedAny
-          ? `Unbounded reads in files: ${totalBaseline} -> ${totalAfter} after adding bounded pagination.`
-          : "No patch could be applied automatically.",
+        detail: patched
+          ? `Unbounded reads in ${f.file}: ${before} -> ${remaining} after adding bounded pagination (repo total ${totalBaseline} -> ${totalAfter}).`
+          : "No safe automatic patch could be applied to this site (ambiguous call); verify manually.",
       });
     }
 
@@ -107,18 +109,21 @@ function patchUnboundedFile(content: string, lines: number[]): string {
       changed = true;
     }
   }
-  // If line numbers shifted due to earlier edits we still patch best-effort by exact lines only.
   return changed ? arr.join("\n") : content;
 }
 
+/**
+ * Only patches unambiguous ORM collection reads. Plain `.find()` is excluded:
+ * it may be an array helper, and injecting `take` would produce broken code.
+ */
 function patchUnboundedLine(line: string): string {
   // No arguments: findMany() -> findMany({ take: 50 })
-  if (/\.\w*\bfindMany\s*\(\s*\)/.test(line) || /\.\w*\bfind\s*\(\s*\)/.test(line)) {
-    return line.replace(/(\.\w*(?:findMany|find)\s*\()\s*\)/, "$1{ take: 50 })");
+  if (/\.\w*\b(?:findMany|findAll)\s*\(\s*\)/.test(line)) {
+    return line.replace(/(\.\w*(?:findMany|findAll)\s*\()\s*\)/, "$1{ take: 50 })");
   }
-  // Object argument present: inject take into first object.
-  if (/\.\w*(?:findMany|findAll|findUnique|findFirst|findByPk|find)\s*\(\s*\{/.test(line)) {
-    return line.replace(/(\.\w*(?:findMany|findAll|findUnique|findFirst|findByPk|find)\s*\(\s*\{)/, "$1 take: 50, ");
+  // Object argument present: inject take into the first object.
+  if (/\.\w*(?:findMany|findAll)\s*\(\s*\{/.test(line)) {
+    return line.replace(/(\.\w*(?:findMany|findAll)\s*\(\s*\{)/, "$1 take: 50, ");
   }
   return line;
 }

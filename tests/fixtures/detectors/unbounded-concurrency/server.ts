@@ -15,3 +15,10 @@ const queue: string[] = [];
 export async function fromQueue() {
   return Promise.all(queue.map(async (i) => i));
 }
+
+// Fixed-size constant: not a scaling problem.
+const DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+export async function fixedDays() {
+  return Promise.all(DAYS.map(async (d) => d));
+}

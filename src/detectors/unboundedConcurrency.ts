@@ -22,7 +22,12 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, o
     const arg = node.arguments[0];
     if (arg && ts.isCallExpression(arg) && ts.isPropertyAccessExpression(arg.expression)) {
       const method = arg.expression.name.getText();
-      if ((method === "map" || method === "flatMap") && !isLimited(arg)) {
+      const receiver = arg.expression.expression;
+      // Fixed-size literals / ALL_CAPS constants are not user-sized collections.
+      const fixedSize =
+        ts.isArrayLiteralExpression(receiver) ||
+        (ts.isIdentifier(receiver) && /^[A-Z][A-Z0-9_]{1,}$/.test(receiver.text));
+      if ((method === "map" || method === "flatMap") && !isLimited(arg) && !fixedSize) {
         const ln = lineOf(sf, node);
         out.push(
           makeFinding({

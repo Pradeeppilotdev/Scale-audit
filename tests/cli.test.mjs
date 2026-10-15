@@ -29,3 +29,19 @@ test("cli renders markdown and supports --fail-on exit codes", () => {
   const failCritical = spawnSync(process.execPath, [cli, fixture, "--fail-on", "critical"], { encoding: "utf8" });
   assert.equal(failCritical.status, 0);
 });
+
+test("--verify patches unbounded reads in an isolated copy and reports per-file validity", () => {
+  const unbounded = path.join(root, "tests", "fixtures", "unboundedapp");
+  const r = spawnSync(process.execPath, [cli, unbounded, "--verify"], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const report = JSON.parse(r.stdout);
+  const auto = report.verification.filter((v) => v.findingId === "unbounded-read");
+  assert.ok(auto.length >= 2, "expected at least 2 auto-verifiable findings");
+  assert.ok(auto.every((v) => v.patchApplied === true), JSON.stringify(auto));
+  assert.ok(auto.every((v) => v.validity === 100), JSON.stringify(auto));
+
+  // The original fixture must be untouched (verify works on a temp copy).
+  const original = spawnSync(process.execPath, [cli, unbounded], { encoding: "utf8" });
+  const after = JSON.parse(original.stdout);
+  assert.ok(after.findings.some((f) => f.id === "unbounded-read"), "fixture should still have unbounded reads");
+});

@@ -8,17 +8,42 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const server = path.join(root, "dist", "server.js");
 const fixture = path.join(root, "tests", "fixtures", "badapp");
 
-test("web server runs an audit and serves an HTML report", async () => {
+function spawnServer(extraEnv = {}) {
   const port = 18000 + Math.floor(Math.random() * 1000);
-  const child = spawn(process.execPath, [server], { env: { ...process.env, PORT: String(port) }, stdio: "ignore" });
-  const base = `http://localhost:${port}`;
+  const child = spawn(process.execPath, [server], { env: { ...process.env, PORT: String(port), ...extraEnv }, stdio: "ignore" });
+  return { child, base: `http://localhost:${port}` };
+}
+
+async function postAudit(base, repo) {
+  return fetch(`${base}/api/audit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ repo }),
+  });
+}
+
+test("web server rejects local paths and non-github URLs by default", async () => {
+  const { child, base } = spawnServer();
   try {
     await waitForReady(base);
-    const created = await fetch(`${base}/api/audit`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repo: fixture }),
-    });
+    const local = await postAudit(base, fixture);
+    assert.equal(local.status, 400, "local paths must be rejected without opt-in");
+
+    const evil = await postAudit(base, "https://evil.example.com/owner/repo");
+    assert.equal(evil.status, 400, "non-github hosts must be rejected");
+
+    const traversal = await postAudit(base, "/etc");
+    assert.equal(traversal.status, 400);
+  } finally {
+    child.kill("SIGTERM");
+  }
+});
+
+test("web server runs an audit and serves an HTML report", async () => {
+  const { child, base } = spawnServer({ SCALE_AUDIT_ALLOW_LOCAL: "1" });
+  try {
+    await waitForReady(base);
+    const created = await postAudit(base, fixture);
     assert.equal(created.status, 202);
     const { id } = await created.json();
 

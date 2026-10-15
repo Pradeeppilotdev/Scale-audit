@@ -25,7 +25,7 @@ const SYNC_BLOCKING = new Set([
   "deflateSync",
 ]);
 
-const IMAGE_LIBS = /\b(sharp|jimp|gm|imagemagick)\b/;
+const IMAGE_LIBS = /\b(?:sharp|jimp|gm)\s*\(|\bimagemagick\b\s*[.(]/;
 
 export async function detectSyncIo(root: string): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -70,8 +70,21 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
       ts.isPropertyAccessExpression(node.expression) ? node.expression.name.getText() : ts.isIdentifier(node.expression) ? node.expression.text : "";
     if (SYNC_BLOCKING.has(name) || /(FileSync|DirSync)$/.test(name)) {
       const ln = lineOf(sf, node);
-      const severity = isScript ? "low" : hotPath ? "high" : "medium";
-      const confidence = isScript ? "low" : hotPath ? "medium" : "low";
+      const inFunction = isInsideFunction(node);
+      const startup = !inFunction && !isScript;
+      const severity = isScript || startup ? "low" : hotPath ? "high" : "medium";
+      const confidence = isScript || startup ? "low" : hotPath ? "medium" : "low";
+      const message = startup
+        ? `Synchronous call "${name}" runs at module scope (startup/config).`
+        : `Synchronous call "${name}" blocks the event loop.`;
+      const scaleTrigger = isScript
+        ? "Script sync call; not a runtime bottleneck unless run in a request path."
+        : startup
+          ? "Startup sync call; fine once at boot, dangerous if imported into a request path."
+          : "Under concurrency, sync calls stall all requests.";
+      const suggestedFix = isScript || startup
+        ? "Keep at startup only; never call from request handlers."
+        : "Replace with the async equivalent and ensure the hot path stays non-blocking.";
       out.push(
         makeFinding({
           id: "sync-io",
@@ -80,19 +93,34 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
           confidence,
           file: rel,
           line: ln,
-          message: `Synchronous call "${name}" blocks the event loop.`,
-          scaleTrigger: isScript
-            ? "Startup/script sync call; not a runtime bottleneck unless run in a request path."
-            : "Under concurrency, sync calls stall all requests.",
-          suggestedFix: isScript
-            ? "No action needed for scripts; keep out of request handlers."
-            : "Replace with the async equivalent and ensure the hot path stays non-blocking.",
+          message,
+          scaleTrigger,
+          suggestedFix,
           snippet: snippetAt(content, ln),
         }),
       );
     }
   }
   ts.forEachChild(node, (c) => visitSync(c, sf, content, rel, out, hotPath, isScript));
+}
+
+function isInsideFunction(node: ts.Node): boolean {
+  let cur: ts.Node | undefined = node.parent;
+  while (cur) {
+    if (
+      ts.isFunctionDeclaration(cur) ||
+      ts.isFunctionExpression(cur) ||
+      ts.isArrowFunction(cur) ||
+      ts.isMethodDeclaration(cur) ||
+      ts.isGetAccessorDeclaration(cur) ||
+      ts.isSetAccessorDeclaration(cur) ||
+      ts.isConstructorDeclaration(cur)
+    ) {
+      return true;
+    }
+    cur = cur.parent;
+  }
+  return false;
 }
 
 function findLine(content: string, re: RegExp): number | null {

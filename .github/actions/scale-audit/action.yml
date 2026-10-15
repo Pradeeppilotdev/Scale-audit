@@ -2,13 +2,17 @@ name: Scale Audit
 description: Static scale-readiness audit for Node/TS repos; comments findings on pull requests.
 inputs:
   repo:
-    description: Repo URL or local path to audit (defaults to the current repository).
+    description: Repo URL or local path to audit (defaults to the checked-out workspace).
     required: false
-    default: ""
+    default: ${{ github.workspace }}
   fail-on:
     description: Optional severity threshold to fail the action (critical|high|medium|low).
     required: false
     default: ""
+  version:
+    description: Version of @pradeeppilot/scale-audit to run.
+    required: false
+    default: "0.3.0"
   github-token:
     description: Token used to post the PR comment.
     required: false
@@ -21,16 +25,17 @@ runs:
       env:
         INPUT_REPO: ${{ inputs.repo }}
         FAIL_ON: ${{ inputs.fail-on }}
+        AUDIT_VERSION: ${{ inputs.version }}
       run: |
         REPO="$INPUT_REPO"
         if [ -z "$REPO" ]; then
-          REPO="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          REPO="$GITHUB_WORKSPACE"
         fi
         ARGS=("$REPO" --format md --out scale-audit-report.md)
         if [ -n "$FAIL_ON" ]; then
           ARGS+=(--fail-on "$FAIL_ON")
         fi
-        npx --yes @pradeeppilot/scale-audit "${ARGS[@]}"
+        npx --yes "@pradeeppilot/scale-audit@$AUDIT_VERSION" "${ARGS[@]}"
     - name: Comment on PR
       if: always() && github.event_name == 'pull_request'
       uses: actions/github-script@v7

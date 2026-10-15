@@ -57,6 +57,22 @@ async function readJson(req: IncomingMessage): Promise<any> {
   return raw ? JSON.parse(raw) : {};
 }
 
+const REMOTE_REPO = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\.git)?$/i;
+const REMOTE_GIT = /^git@github\.com:[\w.-]+\/[\w.-]+(?:\.git)?$/i;
+const ALLOW_LOCAL = process.env.SCALE_AUDIT_ALLOW_LOCAL === "1";
+
+function isAllowedRepo(repo: string): boolean {
+  if (REMOTE_REPO.test(repo) || REMOTE_GIT.test(repo)) return true;
+  if (ALLOW_LOCAL && (repo.startsWith("/") || repo.startsWith("./") || repo.startsWith("../") || repo.startsWith("~"))) return true;
+  return false;
+}
+
+function pruneJobs() {
+  if (jobs.size < 200) return;
+  const done = [...jobs.values()].filter((j) => j.status === "done" || j.status === "error").sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  for (const j of done.slice(0, Math.max(0, jobs.size - 150))) jobs.delete(j.id);
+}
+
 function send(res: ServerResponse, status: number, body: string, type = "text/plain") {
   res.writeHead(status, { "content-type": type });
   res.end(body);
@@ -101,12 +117,18 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/") return send(res, 200, HOME, "text/html; charset=utf-8");
+    if (req.method === "GET" && url.pathname === "/health") {
+      return send(res, 200, JSON.stringify({ ok: true, jobs: jobs.size, running }), "application/json");
+    }
 
     if (req.method === "POST" && url.pathname === "/api/audit") {
       const body = await readJson(req);
       const repo = String(body.repo ?? "").trim();
       if (!repo) return send(res, 400, JSON.stringify({ error: "repo is required" }), "application/json");
-      if (!/^https?:\/\/|^git@|^\.|\//.test(repo)) return send(res, 400, JSON.stringify({ error: "unsupported repo value" }), "application/json");
+      if (!isAllowedRepo(repo)) {
+        return send(res, 400, JSON.stringify({ error: "only public github.com repo URLs are allowed" }), "application/json");
+      }
+      pruneJobs();
       const job = enqueue(repo, Boolean(body.verify));
       return send(res, 202, JSON.stringify({ id: job.id, status: job.status }), "application/json");
     }
@@ -132,6 +154,16 @@ const server = createServer(async (req, res) => {
 });
 
 const port = Number(process.env.PORT ?? 8787);
-server.listen(port, () => {
-  console.log(`scale-audit web listening on http://localhost:${port}`);
+const host = process.env.HOST ?? "127.0.0.1";
+server.listen(port, host, () => {
+  console.log(`scale-audit web listening on http://${host}:${port}`);
 });
+
+function shutdown(signal: string) {
+  console.log(`received ${signal}, draining connections`);
+  server.close(() => process.exit(0));
+  // Do not hang forever on keep-alive connections.
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

@@ -3,6 +3,8 @@ import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFind
 import type { Finding } from "../types.js";
 
 const AXIOS_METHODS = new Set(["get", "post", "put", "delete", "patch", "head", "options", "request"]);
+// `axios.create({ timeout: ... })` at module scope configures a shared client.
+const SHARED_AXIOS_TIMEOUT = /axios\.create\s*\(\s*\{[\s\S]{0,400}?timeout\s*:/;
 
 export async function detectOutboundTimeouts(root: string): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -12,36 +14,42 @@ export async function detectOutboundTimeouts(root: string): Promise<Finding[]> {
     if (!content) continue;
     const sf = parseSource(rel, content);
     if (!sf) continue;
-    visit(sf, sf, content, rel, out);
+    visit(sf, sf, content, rel, SHARED_AXIOS_TIMEOUT.test(content), out);
   }
   return out;
 }
 
-function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[]) {
+function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, sharedAxiosTimeout: boolean, out: Finding[]) {
   if (ts.isCallExpression(node)) {
     const target = calleeInfo(node.expression);
     if (target) {
-      const config = findConfigArg(node, target.kind);
-      if (!hasTimeoutOrSignal(config)) {
-        const ln = lineOf(sf, node);
-        out.push(
-          makeFinding({
-            id: "outbound-no-timeout",
-            category: "Resilience",
-            severity: "medium",
-            confidence: "medium",
-            file: rel,
-            line: ln,
-            message: `Outbound HTTP call (${target.name}) has no timeout/abort signal configured.`,
-            scaleTrigger: "A slow downstream stalls requests and can exhaust sockets/connections under load.",
-            suggestedFix: "Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) }) or axios timeout) and consider retries with backoff.",
-            snippet: snippetAt(content, ln),
-          }),
-        );
+      const sharedClientCovers = target.kind === "axios" && sharedAxiosTimeout;
+      if (!sharedClientCovers) {
+        const check = timeoutCheck(node, target);
+        if (check !== "bounded") {
+          const unknown = check === "unknown";
+          const ln = lineOf(sf, node);
+          out.push(
+            makeFinding({
+              id: "outbound-no-timeout",
+              category: "Resilience",
+              severity: unknown ? "low" : "medium",
+              confidence: unknown ? "low" : "medium",
+              file: rel,
+              line: ln,
+              message: unknown
+                ? `Outbound HTTP call (${target.name}) uses a config object passed as a variable; could not confirm a timeout/abort signal.`
+                : `Outbound HTTP call (${target.name}) has no timeout/abort signal configured.`,
+              scaleTrigger: "A slow downstream stalls requests and can exhaust sockets/connections under load.",
+              suggestedFix: "Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) }) or axios timeout) and consider retries with backoff.",
+              snippet: snippetAt(content, ln),
+            }),
+          );
+        }
       }
     }
   }
-  ts.forEachChild(node, (c) => visit(c, sf, content, rel, out));
+  ts.forEachChild(node, (c) => visit(c, sf, content, rel, sharedAxiosTimeout, out));
 }
 
 function calleeInfo(expr: ts.Expression): { name: string; kind: "fetch" | "axios" | "http" } | null {
@@ -56,13 +64,35 @@ function calleeInfo(expr: ts.Expression): { name: string; kind: "fetch" | "axios
   return null;
 }
 
-function findConfigArg(node: ts.CallExpression, kind: "fetch" | "axios" | "http"): ts.ObjectLiteralExpression | null {
-  const candidates: (ts.Expression | undefined)[] = kind === "fetch" ? [node.arguments[1]] : [node.arguments[0], node.arguments[1]];
-  for (const arg of candidates) {
-    const obj = asObject(arg);
-    if (obj) return obj;
+type TimeoutCheck = "bounded" | "unbounded" | "unknown";
+
+function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fetch" | "axios" | "http" }): TimeoutCheck {
+  const args = node.arguments;
+  let config: ts.Expression | undefined;
+
+  if (target.kind === "fetch") {
+    // fetch(url, config?)
+    config = args[1];
+  } else if (target.kind === "axios") {
+    // axios(config) vs axios.get(url, config?)
+    config = target.name === "axios" ? args[0] : args[1];
+  } else {
+    // http.request(options) vs http.request(url, options?)
+    config = args.length >= 2 ? args[1] : args[0];
   }
-  return null;
+
+  if (!config) return "unbounded";
+
+  const obj = asObject(config);
+  if (obj) return hasTimeoutOrSignal(obj) ? "bounded" : "unbounded";
+
+  // String-literal argument in the config position is a URL (http.request("...")).
+  if (ts.isStringLiteral(config) || ts.isNoSubstitutionTemplateLiteral(config) || ts.isTemplateExpression(config)) {
+    return "unbounded";
+  }
+
+  // Config lives in a variable/helper: cannot confirm.
+  return "unknown";
 }
 
 function asObject(arg: ts.Expression | undefined): ts.ObjectLiteralExpression | null {
@@ -74,8 +104,7 @@ function asObject(arg: ts.Expression | undefined): ts.ObjectLiteralExpression | 
   return ts.isObjectLiteralExpression(val) ? val : null;
 }
 
-function hasTimeoutOrSignal(config: ts.ObjectLiteralExpression | null): boolean {
-  if (!config) return false;
+function hasTimeoutOrSignal(config: ts.ObjectLiteralExpression): boolean {
   return config.properties.some((p) => {
     if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) return false;
     const name = p.name.getText().replace(/['"]/g, "");

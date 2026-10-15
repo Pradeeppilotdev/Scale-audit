@@ -71,25 +71,33 @@ function visit(
         const where = findWhereObject(node);
         if (where) {
           for (const p of where.properties) {
-            if (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) {
-              const field = p.name.getText().replace(/['"]/g, "");
-              if (field && !model.indexed.has(field)) {
-                const ln = lineOf(sf, node);
-                out.push(
-                  makeFinding({
-                    id: "missing-index",
-                    category: "DB",
-                    severity: "medium",
-                    confidence: "medium",
-                    file: rel,
-                    line: ln,
-                    message: `Query on model "${model.name}" filters on "${field}", which is not declared as @id/@unique/@@index.`,
-                    scaleTrigger: "Unindexed filter becomes a full table scan as rows grow.",
-                    suggestedFix: `Add an index for the filter column (\`@@index([${field}])\` or \`@unique\`) if this query runs frequently, or constrain the filter.`,
-                    snippet: snippetAt(content, ln),
-                  }),
-                );
-              }
+            if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) continue;
+            const field = p.name.getText().replace(/['"]/g, "");
+            if (!field) continue;
+            // Logical operators and nested relation filters are not columns.
+            if (field === "OR" || field === "AND" || field === "NOT") continue;
+            if (ts.isPropertyAssignment(p)) {
+              const val = unwrap(p.initializer);
+              if (ts.isObjectLiteralExpression(val) || ts.isArrayLiteralExpression(val)) continue;
+              // `field: null` / `field: undefined` style negation is rarely scale-relevant.
+              if (val.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(val) && val.text === "undefined")) continue;
+            }
+            if (!model.indexed.has(field)) {
+              const ln = lineOf(sf, node);
+              out.push(
+                makeFinding({
+                  id: "missing-index",
+                  category: "DB",
+                  severity: "medium",
+                  confidence: "medium",
+                  file: rel,
+                  line: ln,
+                  message: `Query on model "${model.name}" filters on "${field}", which is not declared as @id/@unique/@@index.`,
+                  scaleTrigger: "Unindexed filter becomes a full table scan as rows grow.",
+                  suggestedFix: `Add an index for the filter column (\`@@index([${field}])\` or \`@unique\`) if this query runs frequently, or constrain the filter.`,
+                  snippet: snippetAt(content, ln),
+                }),
+              );
             }
           }
         }
@@ -109,15 +117,20 @@ function modelNameOf(expr: ts.Expression): string | null {
   return null;
 }
 
+function unwrap(expr: ts.Expression): ts.Expression {
+  let val = expr;
+  while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val) || ts.isNonNullExpression(val)) {
+    val = (val as any).expression;
+  }
+  return val;
+}
+
 function findWhereObject(node: ts.CallExpression): ts.ObjectLiteralExpression | null {
   const arg = node.arguments[0];
   if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
   for (const p of arg.properties) {
     if (ts.isPropertyAssignment(p) && p.name.getText().replace(/['"]/g, "") === "where") {
-      let val = p.initializer;
-      while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val)) {
-        val = (val as any).expression;
-      }
+      const val = unwrap(p.initializer);
       if (ts.isObjectLiteralExpression(val)) return val;
     }
   }

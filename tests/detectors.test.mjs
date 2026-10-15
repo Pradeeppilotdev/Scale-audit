@@ -20,16 +20,20 @@ test("n-plus-one flags awaited ORM call inside a loop", async () => {
   assert.equal(findings.filter((f) => f.id === "n-plus-one").length, 1);
 });
 
-test("unbounded reads flag missing and present pagination correctly", async () => {
+test("unbounded reads: flags real gaps, ignores array helpers and options-object limits", async () => {
   const findings = await detectUnboundedReads(fixture("unbounded"));
-  const sites = findings.map((f) => f.line);
-  // unboundedDefault() and unboundedWhere() should be flagged; bounded and chained limit should not.
-  assert.equal(findings.length, 2, `expected 2 findings, got ${findings.length} at lines ${sites}`);
+  const sites = findings.map((f) => `${f.line}:${f.confidence}`);
+  // unboundedDefault, unboundedWhere (high) + variableQuery (low confidence).
+  // chained limit, mongoose 3rd-arg options, and array .find must NOT be flagged.
+  assert.equal(findings.length, 3, `expected 3 findings, got ${findings.length} at ${sites.join(", ")}`);
+  const low = findings.filter((f) => f.confidence === "low");
+  assert.equal(low.length, 1, "variable query must be low confidence");
+  assert.match(low[0].message, /could not be confirmed/);
 });
 
 test("missing-index is scoped per model and honors @unique", async () => {
   const findings = await detectMissingIndexes(fixture("missing-index"));
-  assert.equal(findings.length, 1);
+  assert.equal(findings.length, 1, JSON.stringify(findings.map((f) => f.message)));
   assert.match(findings[0].message, /"name"/);
 });
 
@@ -42,19 +46,28 @@ test("in-process state flags session/rate-limit only when store is absent", asyn
   assert.equal(ids.filter((id) => id === "in-memory-websocket").length, 1);
 });
 
-test("sync-io marks request-path high and scripts low", async () => {
+test("sync-io marks request-path high, scripts and startup low", async () => {
   const findings = await detectSyncIo(fixture("sync-io"));
   const route = findings.find((f) => f.file.includes("routes"));
   const script = findings.find((f) => f.file.includes("scripts"));
+  const startup = findings.find((f) => f.file.endsWith("config.ts"));
   assert.ok(route, "expected route sync finding");
   assert.ok(script, "expected script sync finding");
+  assert.ok(startup, "expected module-scope sync finding");
   assert.equal(route.severity, "high");
   assert.equal(script.severity, "low");
+  assert.equal(startup.severity, "low");
+  assert.match(startup.message, /module scope/);
 });
 
-test("outbound timeouts flag fetch/axios without timeout only", async () => {
+test("outbound timeouts: flags missing config, downgrades variables, honors shared axios client", async () => {
   const findings = await detectOutboundTimeouts(fixture("outbound-timeout"));
-  assert.equal(findings.length, 2, JSON.stringify(findings.map((f) => f.snippet)));
+  const files = findings.map((f) => `${f.file}:${f.confidence}`);
+  assert.equal(findings.length, 3, JSON.stringify(files));
+  assert.ok(!findings.some((f) => f.file.includes("shared")), "shared axios client must be honored");
+  const low = findings.filter((f) => f.confidence === "low");
+  assert.equal(low.length, 1, "variable config must be low confidence");
+  assert.match(low[0].message, /could not confirm/);
 });
 
 test("unbounded concurrency flags Promise.all over unbounded maps", async () => {
