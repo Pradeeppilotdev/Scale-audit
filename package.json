@@ -1,0 +1,35 @@
+{
+  "name": "@pradeeppilot/scale-audit",
+  "version": "0.1.0",
+  "description": "Static scale-readiness audit for public Node.js/TypeScript repos. Clones a repo (read-only) and reports what will break as traffic/users grow.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "scale-audit": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
+    "start": "node dist/cli.js",
+    "analyze": "tsx src/cli.ts",
+    "test": "npm run build && node --test tests/*.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "glob": "^11.1.0",
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.1",
+    "@types/node": "^22.9.0"
+  }
+}
