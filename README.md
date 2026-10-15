@@ -32,6 +32,13 @@ npx @pradeeppilot/scale-audit ./my-app --fail-on high
 - Lifecycle: missing health endpoint, missing graceful shutdown
 - Deps: heavy/deprecated packages
 
+## Local web UI (M2 preview)
+```bash
+npm run build
+npm run serve          # http://localhost:8787
+```
+Paste a repo URL, get a polled job and a shareable HTML report at `/report/<id>`. Jobs are in-memory and analysis runs in-process (v0); a real queue/DB is the next milestone.
+
 ## GitHub Action (PR comment)
 ```yaml
 permissions:
