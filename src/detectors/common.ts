@@ -19,6 +19,11 @@ export async function listSourceFiles(root: string): Promise<string[]> {
       "**/__tests__/**",
       "**/*.test.*",
       "**/*.spec.*",
+      "**/examples/**",
+      "**/example/**",
+      "**/docs/**",
+      "**/benchmarks/**",
+      "**/sandbox/**",
     ],
     nodir: true,
     absolute: false,
@@ -56,6 +61,25 @@ export function snippetAt(content: string, line: number, radius = 1): string {
 
 export function makeFinding(partial: Omit<Finding, "snippet"> & { snippet?: string }): Finding {
   return { snippet: "", ...partial };
+}
+
+const PAGINATION_CHAIN = new Set(["limit", "take", "skip", "first", "top", "last", "offset", "page", "perPage"]);
+
+/** True when a query call is chained with pagination helpers, e.g. Model.find().limit(10). */
+export function hasChainedPagination(node: ts.CallExpression): boolean {
+  let cur: ts.Node = node;
+  while (cur.parent) {
+    const p = cur.parent;
+    if (ts.isPropertyAccessExpression(p) && p.expression === cur) {
+      if (PAGINATION_CHAIN.has(p.name.getText())) return true;
+      cur = p;
+    } else if (ts.isCallExpression(p) && p.expression === cur) {
+      cur = p;
+    } else {
+      break;
+    }
+  }
+  return false;
 }
 
 export const ORM_CALL_NAMES = new Set([

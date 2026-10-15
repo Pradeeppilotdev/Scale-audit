@@ -1,8 +1,8 @@
 import ts from "typescript";
-import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding, isOrmCall } from "./common.js";
+import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding, isOrmCall, hasChainedPagination } from "./common.js";
 import type { Finding } from "../types.js";
 
-const UNIQUE_METHODS = new Set(["findUnique", "findUniqueOrThrow", "findOne", "findByPk", "findByID", "findById"]);
+const UNIQUE_METHODS = new Set(["findUnique", "findUniqueOrThrow", "findOne", "findByPk", "findByID", "findById", "findFirst", "findFirstOrThrow"]);
 const PAGINATION_KEYS = new Set(["take", "limit", "skip", "cursor", "top", "first", "pageSize", "perPage", "offset", "start", "end"]);
 
 export async function detectUnboundedReads(root: string): Promise<Finding[]> {
@@ -51,6 +51,7 @@ function methodNameOf(expr: ts.Expression): string {
 }
 
 function hasPagination(node: ts.CallExpression): boolean {
+  if (hasChainedPagination(node)) return true;
   if (node.arguments.length === 0) return false;
   const arg = node.arguments[0];
   // for SQL query strings, can't tell

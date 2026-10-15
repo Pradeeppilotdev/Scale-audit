@@ -5,9 +5,14 @@ import ts from "typescript";
 import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 
+interface PrismaModel {
+  name: string;
+  indexed: Set<string>;
+}
+
 export async function detectMissingIndexes(root: string): Promise<Finding[]> {
-  const indexed = await loadIndexedFields(root);
-  if (indexed.size === 0) return []; // no schema -> no reliable signal
+  const models = await loadModels(root);
+  if (models.size === 0) return []; // no schema -> no reliable signal
   const out: Finding[] = [];
   const files = await listSourceFiles(root);
   for (const rel of files) {
@@ -15,63 +20,106 @@ export async function detectMissingIndexes(root: string): Promise<Finding[]> {
     if (!content) continue;
     const sf = parseSource(rel, content);
     if (!sf) continue;
-    visit(sf, sf, content, rel, indexed, out);
+    visit(sf, sf, content, rel, models, out);
   }
   return out;
 }
 
-async function loadIndexedFields(root: string): Promise<Set<string>> {
+async function loadModels(root: string): Promise<Map<string, PrismaModel>> {
   const files = await glob("**/*.prisma", { cwd: root, ignore: ["**/node_modules/**"], nodir: true });
-  const out = new Set<string>();
+  const models = new Map<string, PrismaModel>();
   for (const f of files) {
     const content = await readFile(path.join(root, f), "utf8").catch(() => "");
-    // crude parse: capture @id, @unique, and @@index([...]) / @@unique([...])
-    const lines = content.split("\n");
-    for (const line of lines) {
-      const idm = line.match(/(\w+)\s+\w+.*@id\b/);
-      if (idm) out.add(idm[1]);
-      const unm = line.match(/(\w+)\s+\w+.*@unique\b/);
-      if (unm) out.add(unm[1]);
-    }
-    // block-level index
-    const blockIdx = [...content.matchAll(/@@(?:index|unique)\(\s*\[([^\]]+)\]/g)];
-    for (const m of blockIdx) {
-      for (const field of m[1].split(",")) {
-        const name = field.trim().split(/\s/)[0];
-        if (name) out.add(name);
+    const blocks = [...content.matchAll(/model\s+(\w+)\s*\{([\s\S]*?)\n\}/g)];
+    for (const [, name, body] of blocks) {
+      const indexed = new Set<string>();
+      // field-level and block-level indexes only apply to this model
+      for (const line of body.split("\n")) {
+        const trimmed = line.trim();
+        const idm = trimmed.match(/^(\w+)\s+\w+.*@id\b/);
+        if (idm) indexed.add(idm[1]);
+        const unm = trimmed.match(/^(\w+)\s+\w+.*@unique\b/);
+        if (unm) indexed.add(unm[1]);
+        const blockIdx = trimmed.match(/@@(?:index|unique)\(\s*\[([^\]]+)\]/);
+        if (blockIdx) {
+          for (const field of blockIdx[1].split(",")) {
+            const fieldName = field.trim().split(/\s/)[0];
+            if (fieldName) indexed.add(fieldName);
+          }
+        }
       }
+      models.set(name.toLowerCase(), { name, indexed });
     }
   }
-  return out;
+  return models;
 }
 
-function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, indexed: Set<string>, out: Finding[]) {
-  if (ts.isPropertyAssignment(node) && node.name.getText().replace(/['"]/g, "") === "where") {
-    const val = node.initializer;
-    if (ts.isObjectLiteralExpression(val)) {
-      for (const p of val.properties) {
-        if (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) {
-          const field = p.name.getText().replace(/['"]/g, "");
-          if (field && !indexed.has(field)) {
-            const ln = lineOf(sf, node);
-            out.push(
-              makeFinding({
-                id: "missing-index",
-                category: "DB",
-                severity: "medium",
-                confidence: "low",
-                file: rel,
-                line: ln,
-                message: `Query filters on "${field}", which is not declared as @id/@unique/@@index in the Prisma schema. Verify an index exists.`,
-                scaleTrigger: "Unindexed filter becomes a full table scan as rows grow.",
-                suggestedFix: `Add an index for the filter column (\`@@index([${field}])\` or \`@unique\`) if this query runs frequently, or constrain the filter.`,
-                snippet: snippetAt(content, ln),
-              }),
-            );
+function visit(
+  node: ts.Node,
+  sf: ts.SourceFile,
+  content: string,
+  rel: string,
+  models: Map<string, PrismaModel>,
+  out: Finding[],
+) {
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+    const method = node.expression.name.getText();
+    if (isPrismaRead(method)) {
+      const modelName = modelNameOf(node.expression.expression);
+      const model = modelName ? models.get(modelName.toLowerCase()) : undefined;
+      if (model) {
+        const where = findWhereObject(node);
+        if (where) {
+          for (const p of where.properties) {
+            if (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) {
+              const field = p.name.getText().replace(/['"]/g, "");
+              if (field && !model.indexed.has(field)) {
+                const ln = lineOf(sf, node);
+                out.push(
+                  makeFinding({
+                    id: "missing-index",
+                    category: "DB",
+                    severity: "medium",
+                    confidence: "medium",
+                    file: rel,
+                    line: ln,
+                    message: `Query on model "${model.name}" filters on "${field}", which is not declared as @id/@unique/@@index.`,
+                    scaleTrigger: "Unindexed filter becomes a full table scan as rows grow.",
+                    suggestedFix: `Add an index for the filter column (\`@@index([${field}])\` or \`@unique\`) if this query runs frequently, or constrain the filter.`,
+                    snippet: snippetAt(content, ln),
+                  }),
+                );
+              }
+            }
           }
         }
       }
     }
   }
-  ts.forEachChild(node, (c) => visit(c, sf, content, rel, indexed, out));
+  ts.forEachChild(node, (c) => visit(c, sf, content, rel, models, out));
+}
+
+function isPrismaRead(method: string): boolean {
+  return ["findMany", "findFirst", "findUnique", "findUniqueOrThrow", "findFirstOrThrow", "count", "aggregate", "groupBy"].includes(method);
+}
+
+/** Extract the model token from `prisma.user` / `tx.user` / `this.prisma.user`. */
+function modelNameOf(expr: ts.Expression): string | null {
+  if (ts.isPropertyAccessExpression(expr)) return expr.name.getText();
+  return null;
+}
+
+function findWhereObject(node: ts.CallExpression): ts.ObjectLiteralExpression | null {
+  const arg = node.arguments[0];
+  if (!arg || !ts.isObjectLiteralExpression(arg)) return null;
+  for (const p of arg.properties) {
+    if (ts.isPropertyAssignment(p) && p.name.getText().replace(/['"]/g, "") === "where") {
+      let val = p.initializer;
+      while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val)) {
+        val = (val as any).expression;
+      }
+      if (ts.isObjectLiteralExpression(val)) return val;
+    }
+  }
+  return null;
 }

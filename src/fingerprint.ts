@@ -20,7 +20,7 @@ export async function fingerprintRepo(root: string): Promise<Fingerprint> {
 
   const sourceFiles = await glob("**/*.{ts,tsx,js,jsx,mjs,cjs}", {
     cwd: root,
-    ignore: ["**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**", "**/coverage/**"],
+    ignore: ["**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**", "**/coverage/**", "**/examples/**", "**/docs/**", "**/benchmarks/**"],
     nodir: true,
   });
 

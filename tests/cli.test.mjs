@@ -17,3 +17,15 @@ test("cli audits fixture and finds sync I/O + in-process session", () => {
   assert.ok(ids.includes("sync-io"), "expected sync-io finding");
   assert.ok(ids.includes("in-process-session"), "expected in-process-session finding");
 });
+
+test("cli renders markdown and supports --fail-on exit codes", () => {
+  const md = spawnSync(process.execPath, [cli, fixture, "--format", "md"], { encoding: "utf8" });
+  assert.equal(md.status, 0, md.stderr);
+  assert.match(md.stdout, /# Scale-Readiness Report/);
+
+  const failHigh = spawnSync(process.execPath, [cli, fixture, "--fail-on", "high"], { encoding: "utf8" });
+  assert.equal(failHigh.status, 2);
+
+  const failCritical = spawnSync(process.execPath, [cli, fixture, "--fail-on", "critical"], { encoding: "utf8" });
+  assert.equal(failCritical.status, 0);
+});
