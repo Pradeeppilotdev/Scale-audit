@@ -1,6 +1,6 @@
 {
   "name": "@pradeeppilot/scale-audit",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Static scale-readiness audit for public Node.js/TypeScript repos. Clones a repo (read-only) and reports what will break as traffic/users grow.",
   "type": "module",
   "license": "MIT",
