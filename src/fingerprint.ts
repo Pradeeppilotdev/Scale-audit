@@ -20,8 +20,27 @@ export async function fingerprintRepo(root: string): Promise<Fingerprint> {
 
   const sourceFiles = await glob("**/*.{ts,tsx,js,jsx,mjs,cjs}", {
     cwd: root,
-    ignore: ["**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**", "**/coverage/**", "**/examples/**", "**/docs/**", "**/benchmarks/**"],
+    ignore: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/.git/**",
+      "**/coverage/**",
+      "**/examples/**",
+      "**/docs/**",
+      "**/benchmarks/**",
+      "**/.next/**",
+      "**/.nuxt/**",
+      "**/.svelte-kit/**",
+      "**/.turbo/**",
+      "**/.vercel/**",
+      "**/.output/**",
+      "**/.cache/**",
+      "**/.venv/**",
+      "**/venv/**",
+    ],
     nodir: true,
+    follow: false,
   });
 
   const hasTests = sourceFiles.some((f) => /(\.test\.|\.spec\.|__tests__)/.test(f)) || Boolean(devDeps.jest || devDeps.vitest || devDeps.mocha);
