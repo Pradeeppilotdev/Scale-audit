@@ -7,7 +7,6 @@ import type { Report } from "./types.js";
 interface Job {
   id: string;
   repo: string;
-  verify: boolean;
   status: "queued" | "running" | "done" | "error";
   createdAt: string;
   report?: Report;
@@ -19,8 +18,8 @@ const queue: string[] = [];
 const MAX_CONCURRENCY = Number(process.env.SCALE_AUDIT_CONCURRENCY ?? 2);
 let running = 0;
 
-function enqueue(repo: string, verify: boolean): Job {
-  const job: Job = { id: randomUUID(), repo, verify, status: "queued", createdAt: new Date().toISOString() };
+function enqueue(repo: string): Job {
+  const job: Job = { id: randomUUID(), repo, status: "queued", createdAt: new Date().toISOString() };
   jobs.set(job.id, job);
   queue.push(job.id);
   pump();
@@ -34,7 +33,7 @@ function pump() {
     if (!job) continue;
     running++;
     job.status = "running";
-    runAudit(job.repo, { verifyFixes: job.verify })
+    runAudit(job.repo, { codemod: "diff" })
       .then((report) => {
         job.report = report;
         job.status = "done";
@@ -71,6 +70,30 @@ function pruneJobs() {
   if (jobs.size < 200) return;
   const done = [...jobs.values()].filter((j) => j.status === "done" || j.status === "error").sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   for (const j of done.slice(0, Math.max(0, jobs.size - 150))) jobs.delete(j.id);
+}
+
+/**
+ * A minimal per-IP rate limit.
+ *
+ * An audit clones and analyses a repository, so an unbounded endpoint is a
+ * denial-of-service surface. Ten requests a minute per client is plenty.
+ */
+const RATE_LIMIT = 10;
+const RATE_WINDOW_MS = 60_000;
+const hits = new Map<string, number[]>();
+
+function allowRequest(req: IncomingMessage): boolean {
+  const ip = req.socket.remoteAddress ?? "unknown";
+  const now = Date.now();
+  const recent = (hits.get(ip) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (recent.length >= RATE_LIMIT) {
+    hits.set(ip, recent);
+    return false;
+  }
+  recent.push(now);
+  hits.set(ip, recent);
+  if (hits.size > 1000) hits.clear();
+  return true;
 }
 
 function send(res: ServerResponse, status: number, body: string, type = "text/plain") {
@@ -122,14 +145,22 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/audit") {
-      const body = await readJson(req);
+      if (!allowRequest(req)) {
+        return send(res, 429, JSON.stringify({ error: "too many requests" }), "application/json");
+      }
+      let body: any;
+      try {
+        body = await readJson(req);
+      } catch {
+        return send(res, 400, JSON.stringify({ error: "invalid JSON body" }), "application/json");
+      }
       const repo = String(body.repo ?? "").trim();
       if (!repo) return send(res, 400, JSON.stringify({ error: "repo is required" }), "application/json");
       if (!isAllowedRepo(repo)) {
         return send(res, 400, JSON.stringify({ error: "only public github.com repo URLs are allowed" }), "application/json");
       }
       pruneJobs();
-      const job = enqueue(repo, Boolean(body.verify));
+      const job = enqueue(repo);
       return send(res, 202, JSON.stringify({ id: job.id, status: job.status }), "application/json");
     }
 
@@ -155,6 +186,12 @@ const server = createServer(async (req, res) => {
 
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? "127.0.0.1";
+
+// The server this tool ships with should pass its own audit.
+server.requestTimeout = 30_000;
+server.headersTimeout = 35_000;
+server.keepAliveTimeout = 10_000;
+
 server.listen(port, host, () => {
   console.log(`scale-audit web listening on http://${host}:${port}`);
 });

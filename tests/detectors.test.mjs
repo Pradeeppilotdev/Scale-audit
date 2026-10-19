@@ -14,6 +14,9 @@ const { detectSyncIo } = await import(path.join(root, "dist", "detectors", "sync
 const { detectOutboundTimeouts } = await import(path.join(root, "dist", "detectors", "outboundTimeout.js"));
 const { detectUnboundedConcurrency } = await import(path.join(root, "dist", "detectors", "unboundedConcurrency.js"));
 const { detectLifecycle } = await import(path.join(root, "dist", "detectors", "lifecycle.js"));
+const { detectFloatingPromises } = await import(path.join(root, "dist", "detectors", "floatingPromise.js"));
+const { detectSequentialAwaits } = await import(path.join(root, "dist", "detectors", "sequentialAwait.js"));
+const { detectPerRequestClients } = await import(path.join(root, "dist", "detectors", "perRequestClient.js"));
 
 test("n-plus-one flags awaited ORM call inside a loop", async () => {
   const findings = await detectNPlusOne(fixture("n1"));
@@ -33,13 +36,23 @@ test("unbounded reads: flags real gaps, ignores array helpers, options-object li
   assert.match(low[0].message, /could not be confirmed/);
 });
 
+test("unbounded reads: aggregates and service classes are not database reads", async () => {
+  const findings = await detectUnboundedReads(fixture("unbounded"));
+  assert.ok(!findings.some((f) => f.snippet.includes("aggregateCall")), "aggregate() is bounded and must not be flagged");
+  assert.ok(!findings.some((f) => f.snippet.includes("countCall")), "count() is bounded and must not be flagged");
+  assert.ok(!findings.some((f) => f.snippet.includes("serviceCall")), "UserService.find() is not a database read");
+  assert.ok(!findings.some((f) => f.snippet.includes("chainedLimit")), "a plain object with find() is not a model");
+});
+
 test("missing-index is scoped per project schema and honors @unique", async () => {
   const findings = await detectMissingIndexes(fixture("missing-index"));
-  assert.equal(findings.length, 1, JSON.stringify(findings.map((f) => f.message)));
-  assert.match(findings[0].message, /"name"/);
-  // The scoped project marks clerkId @unique in its own schema: no false positive.
+  const messages = JSON.stringify(findings.map((f) => f.message));
   assert.ok(!findings.some((f) => /clerkId/.test(f.message)), "scoped schema must not leak across projects");
   assert.ok(!findings.some((f) => f.file.includes("scoped")), "scoped project must use its own schema");
+  assert.ok(!findings.some((f) => /tenantId/.test(f.message)), "leading column of a composite index is indexed");
+  assert.ok(findings.some((f) => /"name"/.test(f.message)), "trailing column of a composite index is not indexed on its own");
+  assert.ok(!findings.some((f) => /email/.test(f.message)), "@unique columns are indexed");
+  void messages;
 });
 
 test("in-process state flags session/rate-limit only when store is absent", async () => {
@@ -49,6 +62,14 @@ test("in-process state flags session/rate-limit only when store is absent", asyn
   assert.equal(ids.filter((id) => id === "in-memory-rate-limit").length, 1);
   assert.equal(ids.filter((id) => id === "in-process-state").length, 1);
   assert.equal(ids.filter((id) => id === "in-memory-websocket").length, 1);
+});
+
+test("in-process state: a collection that is only filled at import time is a constant, not state", async () => {
+  const findings = await detectInProcessState(fixture("in-process-state"));
+  const state = findings.filter((f) => f.id === "in-process-state");
+  assert.equal(state.length, 1, JSON.stringify(findings.map((f) => `${f.id}:${f.snippet}`)));
+  assert.match(state[0].snippet, /cache\b/);
+  assert.ok(!state.some((f) => /staticCache/.test(f.snippet)), "a constant lookup table is not runtime state");
 });
 
 test("sync-io marks request-path high, scripts and startup low", async () => {
@@ -63,6 +84,13 @@ test("sync-io marks request-path high, scripts and startup low", async () => {
   assert.equal(script.severity, "low");
   assert.equal(startup.severity, "low");
   assert.match(startup.message, /module scope/);
+});
+
+test("sync-io: a file that merely contains 'api' as a substring is not a request path", async () => {
+  const findings = await detectSyncIo(fixture("sync-io"));
+  const capitalize = findings.filter((f) => f.file.includes("capitalize"));
+  assert.equal(capitalize.length, 1, JSON.stringify(findings.map((f) => `${f.file}:${f.severity}`)));
+  assert.notEqual(capitalize[0].severity, "high", "capitalize.ts must not be treated as a request path");
 });
 
 test("outbound timeouts: real timers bounded, cancellation-only and variables downgraded", async () => {
@@ -92,4 +120,42 @@ test("lifecycle detects missing health endpoint and graceful shutdown", async ()
   const ids = findings.map((f) => f.id);
   assert.ok(ids.includes("missing-health-endpoint"));
   assert.ok(ids.includes("missing-graceful-shutdown"));
+});
+
+test("floating promises: unawaited writes and .then() without .catch()", async () => {
+  const findings = await detectFloatingPromises(fixture("floating-promise"));
+  const floating = findings.filter((f) => f.id === "floating-promise");
+  assert.equal(floating.length, 1, JSON.stringify(findings.map((f) => `${f.id}:${f.snippet}`)));
+  assert.match(floating[0].snippet, /createUser\b/);
+  assert.equal(floating[0].severity, "high");
+
+  const unhandled = findings.filter((f) => f.id === "unhandled-rejection");
+  assert.equal(unhandled.length, 1, JSON.stringify(findings.map((f) => f.id)));
+  assert.match(unhandled[0].snippet, /sendEmail/);
+});
+
+test("per-request clients: a new PrismaClient inside a handler is flagged, module scope is not", async () => {
+  const findings = await detectPerRequestClients(fixture("per-request-client"));
+  assert.equal(findings.length, 2, JSON.stringify(findings.map((f) => `${f.file}:${f.line}`)));
+  assert.ok(findings.every((f) => f.id === "per-request-client"));
+  assert.ok(findings.every((f) => f.severity === "high"), "request-path clients are high severity");
+});
+
+test("per-request clients: a client built in a constructor is a singleton, not per-request", async () => {
+  const findings = await detectPerRequestClients(fixture("per-request-client"));
+  assert.ok(!findings.some((f) => f.snippet.includes("this.pool")), "a DI-constructed client is created once");
+});
+
+test("sequential awaits: only independent calls are reported", async () => {
+  const findings = await detectSequentialAwaits(fixture("sequential-await"));
+  assert.equal(findings.length, 1, JSON.stringify(findings.map((f) => `${f.file}:${f.line}`)));
+  assert.match(findings[0].snippet, /independent/);
+});
+
+test("raw SQL without a LIMIT is an unbounded read", async () => {
+  const findings = await detectUnboundedReads(fixture("raw-query"));
+  const raw = findings.filter((f) => f.id === "unbounded-raw-query");
+  assert.equal(raw.length, 1, JSON.stringify(findings.map((f) => `${f.id}:${f.snippet}`)));
+  assert.match(raw[0].snippet, /allUsers/);
+  assert.equal(raw[0].severity, "high");
 });

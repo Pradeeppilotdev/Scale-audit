@@ -1,32 +1,52 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import ts from "typescript";
-import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding } from "./common.js";
+import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
+import type { FileContext } from "../context.js";
+import { Workspace } from "../workspace.js";
 
-export async function detectInProcessState(root: string): Promise<Finding[]> {
+export async function detectInProcessState(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
-  const files = await listSourceFiles(root);
+  const workspace = ws ?? (await Workspace.load(root));
 
   let pkg: any = {};
   try { pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")); } catch {}
   const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
 
-  for (const rel of files) {
-    const content = await readFileSafe(root, rel);
-    if (!content) continue;
-    const sf = parseSource(rel, content);
-    if (!sf) continue;
+  for (const unit of workspace.units) {
+    const { rel, content, sf, ctx } = unit;
 
-    visitSession(sf, content, rel, out);
-    visitRateLimit(sf, content, rel, out);
+    visitSession(sf, content, rel, ctx, out);
+    visitRateLimit(sf, content, rel, ctx, out);
     visitSocketIo(sf, content, rel, deps, out);
     detectModuleScopeState(sf, content, rel, out);
   }
   return out;
 }
 
-function visitSession(sf: ts.SourceFile, content: string, rel: string, out: Finding[]) {
+/**
+ * How confident we are that a middleware options object has no shared store.
+ * "none" = the options object is visible and has no `store` key.
+ * "unknown" = the options live in a variable, so we cannot tell.
+ */
+type StoreVerdict = "none" | "unknown" | "present";
+
+function storeVerdict(arg: ts.Expression | undefined): StoreVerdict {
+  if (!arg) return "none";
+  let val = arg;
+  while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val) || ts.isNonNullExpression(val)) {
+    val = (val as any).expression;
+  }
+  if (!ts.isObjectLiteralExpression(val)) return "unknown";
+  const hasStore = val.properties.some((p) => {
+    const name = (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) ? p.name.getText().replace(/['"]/g, "") : "";
+    return name === "store";
+  });
+  return hasStore ? "present" : "none";
+}
+
+function visitSession(sf: ts.SourceFile, content: string, rel: string, ctx: FileContext, out: Finding[]) {
   function visit(node: ts.Node) {
     if (ts.isCallExpression(node)) {
       const callee = node.expression.getText();
@@ -35,34 +55,42 @@ function visitSession(sf: ts.SourceFile, content: string, rel: string, out: Find
         callee === "expressSession" ||
         callee === "session.default" ||
         callee.endsWith(".session") ||
-        callee.endsWith(".expressSession");
+        callee.endsWith(".expressSession") ||
+        (ts.isIdentifier(node.expression) && ctx.sessionBindings.has(node.expression.text));
       if (isSession) {
-        let arg = node.arguments[0];
-        while (arg && (ts.isAsExpression(arg) || ts.isParenthesizedExpression(arg) || ts.isTypeAssertionExpression(arg))) {
-          arg = (arg as any).expression;
-        }
-        if (arg && ts.isObjectLiteralExpression(arg)) {
-          const hasStore = arg.properties.some((p) => {
-            const name = (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) ? p.name.getText().replace(/['"]/g, "") : "";
-            return name === "store";
-          });
-          if (!hasStore) {
-            const ln = lineOf(sf, node);
-            out.push(
-              makeFinding({
-                id: "in-process-session",
-                category: "Concurrency",
-                severity: "high",
-                confidence: "medium",
-                file: rel,
-                line: ln,
-                message: "express-session configured without a `store` (defaults to in-memory MemoryStore).",
-                scaleTrigger: "Sessions not shared across instances; MemoryStore is not production-safe for clusters.",
-                suggestedFix: "Configure a shared session store (Redis/DB) via connect-redis or equivalent.",
-                snippet: snippetAt(content, ln),
-              }),
-            );
-          }
+        const verdict = storeVerdict(node.arguments[0]);
+        if (verdict === "none") {
+          const ln = lineOf(sf, node);
+          out.push(
+            makeFinding({
+              id: "in-process-session",
+              category: "Concurrency",
+              severity: "high",
+              confidence: "medium",
+              file: rel,
+              line: ln,
+              message: "express-session configured without a `store` (defaults to in-memory MemoryStore).",
+              scaleTrigger: "Sessions not shared across instances; MemoryStore is not production-safe for clusters.",
+              suggestedFix: "Configure a shared session store (Redis/DB) via connect-redis or equivalent.",
+              snippet: snippetAt(content, ln),
+            }),
+          );
+        } else if (verdict === "unknown") {
+          const ln = lineOf(sf, node);
+          out.push(
+            makeFinding({
+              id: "in-process-session",
+              category: "Concurrency",
+              severity: "low",
+              confidence: "low",
+              file: rel,
+              line: ln,
+              message: "express-session options are passed as a variable; could not confirm a shared `store` is configured.",
+              scaleTrigger: "Without a shared store, sessions live in per-instance memory and are lost on restart.",
+              suggestedFix: "Verify the options object sets `store` (Redis/DB); the default is the in-memory MemoryStore.",
+              snippet: snippetAt(content, ln),
+            }),
+          );
         }
       }
     }
@@ -71,24 +99,17 @@ function visitSession(sf: ts.SourceFile, content: string, rel: string, out: Find
   visit(sf);
 }
 
-function visitRateLimit(sf: ts.SourceFile, content: string, rel: string, out: Finding[]) {
+function visitRateLimit(sf: ts.SourceFile, content: string, rel: string, ctx: FileContext, out: Finding[]) {
   function visit(node: ts.Node) {
     if (ts.isCallExpression(node)) {
       const callee = node.expression.getText();
-      const isRateLimit = /(^|\.)rateLimit(\.default)?$/.test(callee) || /(^|\.)rate-limiter(\.default)?$/.test(callee);
+      const isRateLimit =
+        /(^|\.)rateLimit(\.default)?$/.test(callee) ||
+        /(^|\.)rate-limiter(\.default)?$/.test(callee) ||
+        (ts.isIdentifier(node.expression) && ctx.rateLimitBindings.has(node.expression.text));
       if (isRateLimit) {
-        let arg = node.arguments[0];
-        while (arg && (ts.isAsExpression(arg) || ts.isParenthesizedExpression(arg) || ts.isTypeAssertionExpression(arg))) {
-          arg = (arg as any).expression;
-        }
-        let hasStore = false;
-        if (arg && ts.isObjectLiteralExpression(arg)) {
-          hasStore = arg.properties.some((p) => {
-            const name = (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) ? p.name.getText().replace(/['"]/g, "") : "";
-            return name === "store";
-          });
-        }
-        if (!hasStore) {
+        const verdict = storeVerdict(node.arguments[0]);
+        if (verdict === "none") {
           const ln = lineOf(sf, node);
           out.push(
             makeFinding({
@@ -101,6 +122,22 @@ function visitRateLimit(sf: ts.SourceFile, content: string, rel: string, out: Fi
               message: "rate limit middleware configured without a shared `store` (uses in-memory by default).",
               scaleTrigger: "Rate limits reset per instance and can be bypassed behind a load balancer.",
               suggestedFix: "Configure a shared store (Redis) if running more than one instance; otherwise document the single-instance constraint.",
+              snippet: snippetAt(content, ln),
+            }),
+          );
+        } else if (verdict === "unknown") {
+          const ln = lineOf(sf, node);
+          out.push(
+            makeFinding({
+              id: "in-memory-rate-limit",
+              category: "Concurrency",
+              severity: "low",
+              confidence: "low",
+              file: rel,
+              line: ln,
+              message: "rate limit options are passed as a variable; could not confirm a shared `store` is configured.",
+              scaleTrigger: "An in-memory limiter resets per instance and can be bypassed behind a load balancer.",
+              suggestedFix: "Verify the options object sets `store` (Redis) when running more than one instance.",
               snippet: snippetAt(content, ln),
             }),
           );
@@ -169,6 +206,13 @@ function hasSocketIoImport(sf: ts.SourceFile): boolean {
   return found;
 }
 
+/**
+ * Module-level in-memory collections.
+ *
+ * A module-level `new Map()` that is only filled at import time is a constant
+ * lookup table, not runtime state, so it is not reported. Only collections that
+ * are mutated while the process is serving requests qualify.
+ */
 function detectModuleScopeState(sf: ts.SourceFile, content: string, rel: string, out: Finding[]) {
   for (const stmt of sf.statements) {
     if (!ts.isVariableStatement(stmt)) continue;
@@ -178,6 +222,7 @@ function detectModuleScopeState(sf: ts.SourceFile, content: string, rel: string,
       if (!/new\s+Map\s*(<[^>]*>)?\s*\(|new\s+Set\s*(<[^>]*>)?\s*\(/.test(init)) continue;
       const name = decl.name.getText().toLowerCase();
       if (!/(cache|session|state|store|rate|limit|book|registry|tokens)/.test(name)) continue;
+      if (!isMutatedAtRuntime(decl.name.getText(), sf)) continue;
       const ln = lineOf(sf, decl);
       out.push(
         makeFinding({
@@ -188,8 +233,8 @@ function detectModuleScopeState(sf: ts.SourceFile, content: string, rel: string,
           file: rel,
           line: ln,
           message: `Module-level in-memory collection "${decl.name.getText()}" used as state/cache.`,
-          scaleTrigger: "State is not shared across instances/processes.",
-          suggestedFix: "Move state to Redis/shared cache or make the resource stateless.",
+          scaleTrigger: "State is not shared across instances/processes, and the collection grows without bound.",
+          suggestedFix: "Move state to Redis/shared cache, or make the resource stateless.",
           snippet: snippetAt(content, ln),
         }),
       );
@@ -197,10 +242,43 @@ function detectModuleScopeState(sf: ts.SourceFile, content: string, rel: string,
   }
 }
 
-function findLine(content: string, re: RegExp): number | null {
-  const lines = content.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (re.test(lines[i])) return i + 1;
+/** True when the collection is written to from inside a function body. */
+function isMutatedAtRuntime(name: string, sf: ts.SourceFile): boolean {
+  let mutated = false;
+  const visit = (node: ts.Node) => {
+    if (mutated) return;
+    // Only count mutations that happen inside a function (i.e. at request time).
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const receiver = node.expression.expression.getText();
+      const method = node.expression.name.getText();
+      if (receiver === name && (method === "set" || method === "add" || method === "push" || method === "delete" || method === "clear")) {
+        if (isInsideFunctionBody(node)) {
+          mutated = true;
+          return;
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return mutated;
+}
+
+function isInsideFunctionBody(node: ts.Node): boolean {
+  let cur: ts.Node | undefined = node.parent;
+  while (cur) {
+    if (
+      ts.isFunctionDeclaration(cur) ||
+      ts.isFunctionExpression(cur) ||
+      ts.isArrowFunction(cur) ||
+      ts.isMethodDeclaration(cur) ||
+      ts.isGetAccessorDeclaration(cur) ||
+      ts.isSetAccessorDeclaration(cur) ||
+      ts.isConstructorDeclaration(cur)
+    ) {
+      return true;
+    }
+    cur = cur.parent;
   }
-  return null;
+  return false;
 }

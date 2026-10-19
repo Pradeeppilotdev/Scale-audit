@@ -2,6 +2,8 @@ import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -30,20 +32,61 @@ test("cli renders markdown and supports --fail-on exit codes", () => {
   assert.equal(failCritical.status, 0);
 });
 
-test("--verify patches unbounded reads in an isolated copy and reports per-file validity", () => {
+test("--diff prints a unified diff with automated fixes and never touches the repo", () => {
   const unbounded = path.join(root, "tests", "fixtures", "unboundedapp");
-  const r = spawnSync(process.execPath, [cli, unbounded, "--verify"], { encoding: "utf8" });
+  const r = spawnSync(process.execPath, [cli, unbounded, "--diff"], { encoding: "utf8" });
   assert.equal(r.status, 0, r.stderr);
-  const report = JSON.parse(r.stdout);
-  const auto = report.verification.filter((v) => v.findingId === "unbounded-read");
-  assert.ok(auto.length >= 2, "expected at least 2 auto-verifiable findings");
-  assert.ok(auto.every((v) => v.patchApplied === true), JSON.stringify(auto));
-  assert.ok(auto.every((v) => v.validity === 100), JSON.stringify(auto));
+  assert.match(r.stdout, /^--- a\/src\/server\.js/m, "expected a unified diff header");
+  assert.match(r.stdout, /^\+.*take: 50/m, "expected an injected pagination key");
+  assert.ok(!r.stdout.includes('"findings"'), "diff mode must not print the JSON report");
 
-  // The original fixture must be untouched (verify works on a temp copy).
+  // The fixture must be untouched: --diff only prints.
   const original = spawnSync(process.execPath, [cli, unbounded], { encoding: "utf8" });
   const after = JSON.parse(original.stdout);
   assert.ok(after.findings.some((f) => f.id === "unbounded-read"), "fixture should still have unbounded reads");
+});
+
+test("--fix applies automated fixes in place", () => {
+  const unbounded = path.join(root, "tests", "fixtures", "unboundedapp");
+  const copy = fs.mkdtempSync(path.join(os.tmpdir(), "scale-audit-fix-"));
+  try {
+    fs.cpSync(unbounded, copy, { recursive: true });
+    const r = spawnSync(process.execPath, [cli, copy, "--fix"], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    const patched = fs.readFileSync(path.join(copy, "src", "server.js"), "utf8");
+    assert.match(patched, /take: 50/, "expected pagination to be injected");
+    // And the finding should be gone after the fix.
+    const after = JSON.parse(spawnSync(process.execPath, [cli, copy], { encoding: "utf8" }).stdout);
+    assert.ok(!after.findings.some((f) => f.id === "unbounded-read"), "unbounded read should be resolved");
+  } finally {
+    fs.rmSync(copy, { recursive: true, force: true });
+  }
+});
+
+test("--fix refuses to run against a remote URL", () => {
+  const r = spawnSync(process.execPath, [cli, "https://github.com/owner/repo", "--fix"], { encoding: "utf8" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /only works on a local path/);
+});
+
+test("the generated patch is a valid unified diff that git apply accepts", () => {
+  const unbounded = path.join(root, "tests", "fixtures", "unboundedapp");
+  const copy = fs.mkdtempSync(path.join(os.tmpdir(), "scale-audit-patch-"));
+  try {
+    fs.cpSync(unbounded, copy, { recursive: true });
+    const r = spawnSync(process.execPath, [cli, copy, "--diff"], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+
+    // Proper hunk headers, not a whole-file dump.
+    assert.match(r.stdout, /^@@ -\d+,\d+ \+\d+,\d+ @@/m);
+
+    const patchFile = path.join(copy, "fix.patch");
+    fs.writeFileSync(patchFile, r.stdout, "utf8");
+    const check = spawnSync("git", ["apply", "--check", patchFile], { cwd: copy, encoding: "utf8" });
+    assert.equal(check.status, 0, `git apply --check failed: ${check.stderr}`);
+  } finally {
+    fs.rmSync(copy, { recursive: true, force: true });
+  }
 });
 
 test("score is family-capped so one repeated issue class does not zero it out", () => {

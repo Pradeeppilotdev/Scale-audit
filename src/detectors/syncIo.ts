@@ -1,6 +1,7 @@
 import ts from "typescript";
-import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding } from "./common.js";
+import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
+import { Workspace } from "../workspace.js";
 
 const SYNC_BLOCKING = new Set([
   "readFileSync",
@@ -27,17 +28,14 @@ const SYNC_BLOCKING = new Set([
 
 const IMAGE_LIBS = /\b(?:sharp|jimp|gm)\s*\(|\bimagemagick\b\s*[.(]/;
 
-export async function detectSyncIo(root: string): Promise<Finding[]> {
+export async function detectSyncIo(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
-  const files = await listSourceFiles(root);
-  for (const rel of files) {
-    const content = await readFileSafe(root, rel);
-    if (!content) continue;
-    const sf = parseSource(rel, content);
-    if (!sf) continue;
+  const workspace = ws ?? (await Workspace.load(root));
+  for (const unit of workspace.units) {
+    const { rel, content, sf } = unit;
 
     const isScript = /(^|\/)(scripts?|tools?|bin|seed|migrations?|fixtures?|examples?)\//i.test(rel) || /\.config\.|webpack\.config|rollup\.config|vite\.config/i.test(rel);
-    const hotPath = /route|controller|handler|server|app|api/i.test(rel) && !isScript;
+    const hotPath = isRequestPath(rel) && !isScript;
 
     visitSync(sf, sf, content, rel, out, hotPath, isScript);
 
@@ -127,4 +125,45 @@ function findLine(content: string, re: RegExp): number | null {
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) if (re.test(lines[i])) return i + 1;
   return null;
+}
+
+/**
+ * Directory/file names that indicate a request path.
+ *
+ * This used to be a substring match on the whole path (`/route|controller|handler|
+ * server|app|api/i`), which classified `capitalize.ts` (contains "api") and every
+ * file in a monorepo's `apps/` folder as a hot path. Matching whole path segments
+ * removes that noise.
+ */
+const REQUEST_PATH_SEGMENTS = new Set([
+  "route",
+  "routes",
+  "controller",
+  "controllers",
+  "handler",
+  "handlers",
+  "api",
+  "apis",
+  "endpoint",
+  "endpoints",
+  "resolver",
+  "resolvers",
+  "pages",
+  "middleware",
+  "server",
+  "servers",
+  "app",
+  "view",
+  "views",
+]);
+
+export function isRequestPath(rel: string): boolean {
+  const segments = rel.split("/");
+  const last = segments[segments.length - 1] ?? "";
+  const base = last.replace(/\.[^.]+$/, "");
+  if (REQUEST_PATH_SEGMENTS.has(base.toLowerCase())) return true;
+  for (const seg of segments.slice(0, -1)) {
+    if (REQUEST_PATH_SEGMENTS.has(seg.toLowerCase())) return true;
+  }
+  return false;
 }

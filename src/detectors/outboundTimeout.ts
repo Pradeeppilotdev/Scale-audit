@@ -1,6 +1,7 @@
 import ts from "typescript";
-import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding } from "./common.js";
+import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
+import { Workspace } from "../workspace.js";
 
 const AXIOS_METHODS = new Set(["get", "post", "put", "delete", "patch", "head", "options", "request"]);
 // `axios.create({ timeout: ... })` at module scope configures a shared client.
@@ -8,14 +9,10 @@ const SHARED_AXIOS_TIMEOUT = /axios\.create\s*\(\s*\{[\s\S]{0,400}?timeout\s*:/;
 // Only an explicit timer counts as a timeout; a bare AbortController signal is cancellation-only.
 const REAL_TIMEOUT_EXPR = /AbortSignal\.timeout\s*\(/;
 
-export async function detectOutboundTimeouts(root: string): Promise<Finding[]> {
+export async function detectOutboundTimeouts(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
-  const files = await listSourceFiles(root);
-  for (const rel of files) {
-    const content = await readFileSafe(root, rel);
-    if (!content) continue;
-    const sf = parseSource(rel, content);
-    if (!sf) continue;
+  const workspace = ws ?? (await Workspace.load(root));
+  for (const { rel, content, sf } of workspace.units) {
     visit(sf, sf, content, rel, SHARED_AXIOS_TIMEOUT.test(content), out);
   }
   return out;

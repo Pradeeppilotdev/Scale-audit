@@ -2,4 +2,7 @@ model User {
   id    Int     @id
   email String  @unique
   name  String
+  // Composite index: only `tenant` (the leading column) serves a single-column filter.
+  tenantId String
+  @@index([tenantId, name])
 }

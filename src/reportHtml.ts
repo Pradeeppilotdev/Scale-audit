@@ -2,10 +2,11 @@ import type { Report } from "./types.js";
 
 export function renderHtml(report: Report): string {
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  const findings = report.findings
+  const shown = report.findings.slice(0, 100);
+  const findings = shown
     .map(
       (f) => `<div class="finding sev-${f.severity}">
-        <div class="badge">${esc(f.severity)}</div>
+        <div class="badge">${esc(f.severity)}${f.confidence === "low" ? " (low confidence)" : ""}</div>
         <div class="msg">${esc(f.message)}</div>
         <div class="loc">${esc(f.file)}:${f.line} <span class="cat">${esc(f.category)}</span></div>
         <div class="why"><b>Why it breaks:</b> ${esc(f.scaleTrigger)}</div>
@@ -14,8 +15,12 @@ export function renderHtml(report: Report): string {
     )
     .join("\n");
 
-  const verification = (report.verification ?? [])
-    .map((v) => `<li>${esc(v.findingId)} at ${esc(v.file)}:${v.line} — ${v.validity === null ? "manual verify" : `${v.validity}% valid`}</li>`)
+  const categories = (report.summary?.categories ?? [])
+    .map((c) => `<tr><td>${esc(c.category)}</td><td>${c.score}/100</td><td>${c.findings}</td></tr>`)
+    .join("");
+
+  const codemod = (report.codemod?.edits ?? [])
+    .map((e) => `<li>${esc(e.file)}:${e.line} — ${esc(e.description)}</li>`)
     .join("");
 
   return `<!doctype html>
@@ -42,6 +47,8 @@ export function renderHtml(report: Report): string {
   .cat { margin-left:8px; }
   .why, .fix { font-size:13px; color:var(--muted); margin-top:6px; }
   .why b, .fix b { color:var(--text); }
+  table.cats { border-collapse:collapse; margin:12px 0 28px; }
+  table.cats th, table.cats td { text-align:left; padding:6px 18px 6px 0; border-bottom:1px solid var(--line); font-size:13px; }
   a { color:#58a6ff; }
 </style>
 </head>
@@ -50,15 +57,22 @@ export function renderHtml(report: Report): string {
   <h1>Scale-Readiness Report</h1>
   <div class="muted">${esc(report.repo)}${report.commit ? ` @ ${esc(report.commit.slice(0, 12))}` : ""}</div>
   <div class="score">${report.score}/100</div>
-  <div class="muted">Scanned ${esc(report.scannedAt)} · ${report.fingerprint.sourceFileCount} source files · ${esc(report.fingerprint.framework ?? "unknown framework")}</div>
+  <div class="muted">Scanned ${esc(report.scannedAt)} · ${report.fingerprint.sourceFileCount} source files · ${esc(report.fingerprint.framework ?? "unknown framework")}${report.fingerprint.projectType !== "unknown" ? ` · ${esc(report.fingerprint.projectType)}` : ""}</div>
   ${
     report.firstBottleneck
       ? `<div class="verdict"><b>First bottleneck: ${esc(report.firstBottleneck.category)}</b><br/>${esc(report.firstBottleneck.message)}<br/><span class="muted">${esc(report.firstBottleneck.file)}:${report.firstBottleneck.line} — ${esc(report.firstBottleneck.scaleTrigger)}</span></div>`
       : `<div class="verdict">No blocking issues detected by the current detector set.</div>`
   }
+  ${
+    report.fingerprint.projectType === "library"
+      ? `<div class="verdict"><b>This looks like a library, not an application.</b><br/><span class="muted">The score reflects the code's own query and I/O patterns rather than how a deployed service behaves.</span></div>`
+      : ""
+  }
+  ${categories ? `<h2>Score by category</h2><table class="cats"><tr><th>Category</th><th>Score</th><th>Findings</th></tr>${categories}</table>` : ""}
   <h2>Findings (${report.findings.length})</h2>
   ${findings || "<p class='muted'>No findings.</p>"}
-  ${verification ? `<h2>Fix verification</h2><ul>${verification}</ul>` : ""}
+  ${report.findings.length > shown.length ? `<p class="muted">Showing the first ${shown.length} of ${report.findings.length} findings. Use the JSON output for the full list.</p>` : ""}
+  ${codemod ? `<h2>Automated fixes (${report.codemod?.patched})</h2><ul>${codemod}</ul>` : ""}
   ${report.notes.length ? `<h2>Notes</h2><ul>${report.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}
   <h2>What we could not verify</h2>
   <ul class="muted">

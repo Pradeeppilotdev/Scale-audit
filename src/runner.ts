@@ -8,56 +8,44 @@ import { detectSyncIo } from "./detectors/syncIo.js";
 import { detectOutboundTimeouts } from "./detectors/outboundTimeout.js";
 import { detectUnboundedConcurrency } from "./detectors/unboundedConcurrency.js";
 import { detectLifecycle } from "./detectors/lifecycle.js";
+import { detectFloatingPromises } from "./detectors/floatingPromise.js";
+import { detectSequentialAwaits } from "./detectors/sequentialAwait.js";
+import { detectPerRequestClients } from "./detectors/perRequestClient.js";
+import { detectReliability } from "./detectors/reliability.js";
 import type { Fingerprint, Finding, Report } from "./types.js";
-import { verifyFindings } from "./verify.js";
+import { Workspace } from "./workspace.js";
+import { planCodemod, renderDiff, applyPlan } from "./codemod.js";
+import { scoreFindings, type AuditOptions } from "./scoring.js";
 
-const SEVERITY_WEIGHT: Record<Finding["severity"], number> = {
-  critical: 20,
-  high: 10,
-  medium: 5,
-  low: 2,
-  info: 0,
-};
-
-// One repeated issue class (e.g. 100 unbounded reads) should not dominate the score.
-// Each detector family contributes at most this many penalty points.
-const FAMILY_PENALTY_CAP = 20;
+const SEVERITY_RANK: Record<Finding["severity"], number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
 /**
- * Family-capped scoring: findings are grouped by detector id, each family's penalty is
- * capped, low-confidence findings count half, and the total is subtracted from 100.
- * This keeps the score comparable between a 70-file app and a 700-file monorepo.
+ * Detectors that need the parsed workspace. They all share one parse pass,
+ * so adding a detector no longer costs another full re-parse of the repo.
  */
-export function computeScore(findings: Finding[]): number {
-  const byFamily = new Map<string, number>();
-  for (const f of findings) {
-    const weight = SEVERITY_WEIGHT[f.severity] * (f.confidence === "low" ? 0.5 : 1);
-    byFamily.set(f.id, (byFamily.get(f.id) ?? 0) + weight);
-  }
-  let penalty = 0;
-  for (const familyPenalty of byFamily.values()) penalty += Math.min(familyPenalty, FAMILY_PENALTY_CAP);
-  return Math.max(0, Math.min(100, Math.round(100 - penalty)));
-}
-
-export interface AuditOptions { verifyFixes?: boolean; }
+const DETECTORS = [
+  detectNPlusOne,
+  detectUnboundedReads,
+  detectMissingIndexes,
+  detectInProcessState,
+  detectSyncIo,
+  detectOutboundTimeouts,
+  detectUnboundedConcurrency,
+  detectLifecycle,
+  detectFloatingPromises,
+  detectSequentialAwaits,
+  detectPerRequestClients,
+  detectReliability,
+] as const;
 
 export async function runAudit(input: string, options: AuditOptions = {}): Promise<Report> {
   const { root, commit, cleanup } = await resolveRepo(input);
   try {
     const fingerprint = await fingerprintRepo(root);
+    const ws = await Workspace.load(root);
 
     const findings: Finding[] = [];
-    const tasks = [
-      detectNPlusOne(root),
-      detectUnboundedReads(root),
-      detectMissingIndexes(root),
-      detectInProcessState(root),
-      detectSyncIo(root),
-      detectOutboundTimeouts(root),
-      detectUnboundedConcurrency(root),
-      detectLifecycle(root),
-    ];
-    const results = await Promise.all(tasks);
+    const results = await Promise.all(DETECTORS.map((d) => d(root, ws)));
     for (const r of results) findings.push(...r);
 
     // also deps/CVE-ish basic signals
@@ -67,9 +55,9 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     findings.length = 0;
     findings.push(...deduped);
 
-    findings.sort((a, b) => SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity]);
+    findings.sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 
-    const score = computeScore(findings);
+    const { score, categories } = scoreFindings(findings);
 
     let firstBottleneck: Finding | null = null;
     const order: Finding["severity"][] = ["critical", "high", "medium", "low"];
@@ -92,16 +80,38 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
       score,
       firstBottleneck,
       notes,
+      summary: buildSummary(findings, categories),
     };
 
-    if (options.verifyFixes) {
-      report.verification = await verifyFindings(root, findings);
+    if (options.codemod) {
+      const plan = planCodemod(root, findings);
+      const written = options.codemod === "apply" ? applyPlan(root, plan) : [];
+      report.codemod = {
+        diff: renderDiff(plan),
+        patched: plan.patched,
+        unpatched: plan.unpatched,
+        edits: plan.files.flatMap((f) => f.edits),
+        applied: options.codemod === "apply",
+        files: written,
+      };
     }
 
     return report;
   } finally {
     await cleanup();
   }
+}
+
+function buildSummary(findings: Finding[], categories: ReturnType<typeof scoreFindings>["categories"]): Report["summary"] {
+  const bySeverity: Record<string, number> = {};
+  const byCategory: Record<string, number> = {};
+  const byConfidence: Record<string, number> = {};
+  for (const f of findings) {
+    bySeverity[f.severity] = (bySeverity[f.severity] ?? 0) + 1;
+    byCategory[f.category] = (byCategory[f.category] ?? 0) + 1;
+    byConfidence[f.confidence] = (byConfidence[f.confidence] ?? 0) + 1;
+  }
+  return { total: findings.length, bySeverity, byCategory, byConfidence, categories };
 }
 
 function dedupeFindings(findings: Finding[]): Finding[] {

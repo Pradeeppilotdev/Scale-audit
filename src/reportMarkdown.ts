@@ -1,5 +1,8 @@
 import type { Finding, Report } from "./types.js";
 
+/** How many findings to list per category before collapsing into a count. */
+const MAX_PER_CATEGORY = 10;
+
 export function renderMarkdown(report: Report): string {
   const lines: string[] = [];
   lines.push(`# Scale-Readiness Report`);
@@ -10,10 +13,19 @@ export function renderMarkdown(report: Report): string {
   lines.push(`- Framework: ${report.fingerprint.framework ?? "unknown"}`);
   lines.push(`- ORM: ${report.fingerprint.orm ?? "unknown"}`);
   lines.push(`- Source files: ${report.fingerprint.sourceFileCount}`);
+  if (report.fingerprint.projectType !== "unknown") {
+    lines.push(`- Project type: ${report.fingerprint.projectType}`);
+  }
   lines.push("");
   lines.push(`## Verdict`);
   lines.push("");
   lines.push(`**Scale score: ${report.score}/100**`);
+  if (report.fingerprint.projectType === "library") {
+    lines.push("");
+    lines.push(
+      "> This looks like a **library**, not an application. The score reflects the code's own query and I/O patterns rather than how a deployed service behaves.",
+    );
+  }
   if (report.firstBottleneck) {
     lines.push("");
     lines.push(
@@ -27,9 +39,20 @@ export function renderMarkdown(report: Report): string {
     lines.push("No blocking issues detected by the current detector set.");
   }
 
+  if (report.summary?.categories.length) {
+    lines.push("");
+    lines.push(`## Score by category`);
+    lines.push("");
+    lines.push(`| Category | Score | Findings |`);
+    lines.push(`| --- | --- | --- |`);
+    for (const c of report.summary.categories) {
+      lines.push(`| ${c.category} | ${c.score}/100 | ${c.findings} |`);
+    }
+  }
+
   const top = report.findings.slice(0, 5);
   lines.push("");
-  lines.push(`## Top findings (${top.length})`);
+  lines.push(`## Top findings (${top.length} of ${report.findings.length})`);
   lines.push("");
   for (const [i, f] of top.entries()) {
     lines.push(`${i + 1}. **[${f.severity}] ${f.message}**`);
@@ -42,22 +65,31 @@ export function renderMarkdown(report: Report): string {
   const byCategory = group(report.findings);
   lines.push("");
   lines.push(`## All findings by category`);
-  lines.push("");
   for (const [category, items] of byCategory) {
+    lines.push("");
     lines.push(`### ${category} (${items.length})`);
     lines.push("");
-    for (const f of items) {
+    for (const f of items.slice(0, MAX_PER_CATEGORY)) {
       lines.push(`- [${f.severity}] ${f.message} (\`${f.file}:${f.line}\`)`);
     }
-    lines.push("");
+    if (items.length > MAX_PER_CATEGORY) {
+      lines.push(`- …and ${items.length - MAX_PER_CATEGORY} more in this category (use the JSON output for the full list).`);
+    }
   }
 
-  if (report.verification?.length) {
-    lines.push(`## Experimental fix verification (JEV)`);
+  if (report.codemod) {
+    const cm = report.codemod;
+    lines.push(`## Automated fixes`);
     lines.push("");
-    for (const v of report.verification) {
-      const validity = v.validity === null ? "n/a" : `${v.validity}%`;
-      lines.push(`- ${v.findingId} at \`${v.file}:${v.line}\`: ${validity} (${v.method})`);
+    lines.push(`- ${cm.patched} fix(es) generated, ${cm.unpatched} finding(s) need a manual fix.`);
+    for (const e of cm.edits.slice(0, MAX_PER_CATEGORY)) {
+      lines.push(`- \`${e.file}:${e.line}\` — ${e.description}`);
+    }
+    if (cm.diff) {
+      lines.push("");
+      lines.push("```diff");
+      lines.push(cm.diff.trimEnd());
+      lines.push("```");
     }
     lines.push("");
   }

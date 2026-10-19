@@ -1,5 +1,8 @@
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
 
+/** "application" | "library" | "unknown" — a library is not a scale target. */
+export type ProjectType = "application" | "library" | "unknown";
+
 export interface Finding {
   id: string;
   category: string;
@@ -22,17 +25,48 @@ export interface Fingerprint {
   devDeps: Record<string, string>;
   fileCount: number;
   sourceFileCount: number;
+  /** "application" | "library" | "unknown" — a library is not a scale target. */
+  projectType: ProjectType;
 }
 
-export interface VerificationResult {
+/** A single automated fix that was generated for a finding. */
+export interface CodemodEdit {
+  findingId: string;
   file: string;
   line: number;
-  findingId: string;
-  category: "auto" | "manual";
-  patchApplied: boolean;
-  validity: number | null; // positive percentage 0-100
-  method: string;
-  detail: string;
+  description: string;
+  safe: boolean;
+}
+
+export interface CodemodSummary {
+  /** Combined unified diff, ready for `git apply`. */
+  diff: string;
+  /** Findings that produced a patch. */
+  patched: number;
+  /** Findings with no automated fix. */
+  unpatched: number;
+  edits: CodemodEdit[];
+  /** True when the patches were written to disk. */
+  applied: boolean;
+  /** Files that were changed on disk (only when applied). */
+  files: string[];
+}
+
+export interface CategoryScore {
+  category: string;
+  /** 0-100; 100 means nothing was found in this category. */
+  score: number;
+  findings: number;
+  penalty: number;
+  weight: number;
+}
+
+export interface ReportSummary {
+  total: number;
+  bySeverity: Record<string, number>;
+  byCategory: Record<string, number>;
+  byConfidence: Record<string, number>;
+  categories: CategoryScore[];
 }
 
 export interface Report {
@@ -44,5 +78,6 @@ export interface Report {
   score: number;
   firstBottleneck: Finding | null;
   notes: string[];
-  verification?: VerificationResult[];
+  summary?: ReportSummary;
+  codemod?: CodemodSummary;
 }

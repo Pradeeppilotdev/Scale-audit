@@ -19,3 +19,13 @@ export async function byEither() {
 export async function withRelation() {
   return prisma.user.findMany({ where: { profile: { is: { bio: "x" } } } });
 }
+
+// The leading column of a composite index is indexed, so this is fine.
+export async function byTenant() {
+  return prisma.user.findMany({ where: { tenantId: "t1" } });
+}
+
+// The trailing column of a composite index is NOT indexed on its own.
+export async function byNameOnly() {
+  return prisma.user.findMany({ where: { name: "a" } });
+}

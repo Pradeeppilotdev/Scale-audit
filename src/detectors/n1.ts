@@ -1,28 +1,25 @@
 import ts from "typescript";
-import { listSourceFiles, readFileSafe, parseSource, lineOf, snippetAt, makeFinding, isOrmCall } from "./common.js";
+import { lineOf, snippetAt, makeFinding, isOrmCall } from "./common.js";
 import type { Finding } from "../types.js";
+import type { FileContext } from "../context.js";
+import { Workspace } from "../workspace.js";
 
 const LOOP_CALLEE = new Set(["forEach", "map", "flatMap", "filter"]);
 
-export async function detectNPlusOne(root: string): Promise<Finding[]> {
+export async function detectNPlusOne(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
-  const files = await listSourceFiles(root);
-  for (const rel of files) {
-    const content = await readFileSafe(root, rel);
-    if (!content) continue;
-    const sf = parseSource(rel, content);
-    if (!sf) continue;
-    ts.forEachChild(sf, (node) => walk(node, sf, content, rel, out, 0));
+  const workspace = ws ?? (await Workspace.load(root));
+  for (const unit of workspace.units) {
+    ts.forEachChild(unit.sf, (node) => walk(node, unit.sf, unit.content, unit.rel, unit.ctx, out, 0));
   }
   return out;
 }
 
-function walk(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[], loopDepth: number) {
+function walk(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, ctx: FileContext, out: Finding[], loopDepth: number) {
   let depth = loopDepth;
   if (isLoop(node)) depth += 1;
 
-  if (depth > 0 && ts.isAwaitExpression(node) && ts.isCallExpression(node.expression) && isOrmCall(node.expression)) {
-    // ensure not duplicate by only recording the await node
+  if (depth > 0 && ts.isAwaitExpression(node) && ts.isCallExpression(node.expression) && isOrmCall(node.expression, ctx)) {
     const ln = lineOf(sf, node);
     out.push(
       makeFinding({
@@ -41,7 +38,7 @@ function walk(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, ou
     return; // don't traverse further inside this await
   }
 
-  ts.forEachChild(node, (c) => walk(c, sf, content, rel, out, depth));
+  ts.forEachChild(node, (c) => walk(c, sf, content, rel, ctx, out, depth));
 }
 
 function isLoop(node: ts.Node): boolean {
