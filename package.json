@@ -1,6 +1,6 @@
 {
   "name": "@pradeeppilot/scale-audit",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Static scale-readiness audit for public Node.js/TypeScript repos. Clones a repo (read-only) and reports what will break as traffic/users grow.",
   "keywords": [
     "scale",
@@ -61,11 +61,11 @@
     "node": ">=20"
   },
   "dependencies": {
-    "glob": "^11.1.0",
-    "typescript": "^5.6.3"
+    "glob": "^13.0.6",
+    "typescript": "^5.9.3"
   },
   "devDependencies": {
-    "tsx": "^4.19.1",
-    "@types/node": "^22.9.0"
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.1"
   }
 }
