@@ -9,9 +9,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The package declares engines.node >= 20, so every supported major
-        # line is exercised before a release.
-        node-version: [20, 22, 24]
+        # The package requires the Oct 2026 security-patched Node lines.
+        # Node 20 is EOL and no longer receives security fixes.
+        node-version: [22, 24, 26]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,7 +25,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Security-patched release for the Oct 21, 2026 advisories.
+          node-version: 24.22.1
       - run: npm ci
       - run: npm run build
       - run: npm pack --dry-run

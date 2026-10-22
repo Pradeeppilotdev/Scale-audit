@@ -160,4 +160,4 @@ npm test
 npm run build
 ```
 
-Requires Node.js 20+.
+Requires Node.js 22.23.4+, 24.22.1+, or 26.12.1+ (Oct 2026 security patches). Node 20 is EOL and unsupported.
