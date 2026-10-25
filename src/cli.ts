@@ -3,6 +3,7 @@ import { runAudit } from "./runner.js";
 import { renderMarkdown } from "./reportMarkdown.js";
 import { isRemote } from "./clone.js";
 import type { Severity } from "./types.js";
+import { assertSupportedNode } from "./runtime.js";
 
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 
@@ -41,7 +42,7 @@ function parseArgs(argv: string[]): Args {
       else throw new Error(`unknown --format value: ${next}`);
     } else if (a === "--fail-on") {
       const next = args[++i] as Severity;
-      if (!(next in SEVERITY_RANK)) throw new Error(`unknown --fail-on value: ${next}`);
+      if (!Object.hasOwn(SEVERITY_RANK, next)) throw new Error(`unknown --fail-on value: ${next}`);
       failOn = next;
     } else if (a === "--help" || a === "-h") {
       printHelp();
@@ -61,13 +62,13 @@ function printHelp() {
   console.log(`scale-audit - static scale-readiness audit for Node/TS repos
 
 Usage:
-  scale-audit <repo-url-or-local-path> [options]
+  scale-audit <repo-url-or-local-path-or-file> [options]
 
 Options:
   -o, --out <file>       Write report to a file (default: stdout)
   --format <json|md>     Output format (default: json)
   --diff                 Print a unified diff with automated fixes for the findings
-  --fix                  Apply automated fixes in place (local paths only)
+  --fix                  Apply safe fixes in place; skip review-required file plans (local only)
   --fail-on <severity>   Exit with code 2 when a finding at/above this severity
                          exists (critical|high|medium|low). Useful for CI.
   -h, --help             Show this help.
@@ -75,8 +76,9 @@ Options:
 }
 
 async function main() {
-  const { source, out, format, failOn, codemod } = parseArgs(process.argv);
   try {
+    assertSupportedNode();
+    const { source, out, format, failOn, codemod } = parseArgs(process.argv);
     if (codemod === "apply" && isRemote(source)) {
       console.error("scale-audit: --fix only works on a local path; a cloned repo is discarded after the audit.");
       process.exit(1);
@@ -98,9 +100,12 @@ async function main() {
       if (codemod === "apply" && cm) {
         console.error(
           cm.applied && cm.files.length > 0
-            ? `scale-audit: applied ${cm.patched} fix(es) to ${cm.files.length} file(s): ${cm.files.join(", ")}`
+            ? `scale-audit: applied ${cm.appliedEdits} fix(es) to ${cm.files.length} file(s): ${cm.files.join(", ")}`
             : "scale-audit: no automated fixes were applied.",
         );
+        if (cm.edits.some((edit) => !edit.safe)) {
+          console.error("scale-audit: review-required suggestions were not applied; inspect them with --diff.");
+        }
       }
       const output = format === "md" ? renderMarkdown(report) : JSON.stringify(report, null, 2);
       if (out) {

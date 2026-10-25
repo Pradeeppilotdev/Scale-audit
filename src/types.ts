@@ -46,7 +46,11 @@ export interface CodemodSummary {
   /** Findings with no automated fix. */
   unpatched: number;
   edits: CodemodEdit[];
-  /** True when the patches were written to disk. */
+  /** Sites that need a manual fix rather than a generated patch. */
+  manual: CodemodEdit[];
+  /** Number of generated edits actually written to disk. */
+  appliedEdits: number;
+  /** True when at least one file was written to disk. */
   applied: boolean;
   /** Files that were changed on disk (only when applied). */
   files: string[];
@@ -69,7 +73,14 @@ export interface ReportSummary {
   categories: CategoryScore[];
 }
 
+export interface AuditCoverage {
+  discovered: number;
+  analyzed: number;
+  skipped: { file: string; reason: string }[];
+}
+
 export interface Report {
+  coverage?: AuditCoverage;
   repo: string;
   commit: string | null;
   scannedAt: string;

@@ -11,22 +11,24 @@ jobs:
       matrix:
         # The package requires the Oct 2026 security-patched Node lines.
         # Node 20 is EOL and no longer receives security fixes.
-        node-version: [22, 24, 26]
+        node-version: ["^22.23.4", "^24.22.1", "^26.12.1"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
+          check-latest: true
       - run: npm ci
       - run: npm test
   pack:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          # Security-patched release for the Oct 21, 2026 advisories.
-          node-version: 24.22.1
+          # Never fall below the Oct 21, 2026 security floor.
+          node-version: "^24.22.1"
+          check-latest: true
       - run: npm ci
       - run: npm run build
       - run: npm pack --dry-run

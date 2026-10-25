@@ -1,5 +1,5 @@
 import ts from "typescript";
-import { lineOf, snippetAt, makeFinding, isOrmCall, hasChainedPagination, asObjectLiteral, DB_RECEIVER } from "./common.js";
+import { lineOf, snippetAt, makeFinding, isOrmCall, chainedPagination, asObjectLiteral, DB_RECEIVER, isKnownModel } from "./common.js";
 import type { Finding } from "../types.js";
 import type { FileContext } from "../context.js";
 import { Workspace } from "../workspace.js";
@@ -7,12 +7,12 @@ import { Workspace } from "../workspace.js";
 const UNIQUE_METHODS = new Set(["findUnique", "findUniqueOrThrow", "findOne", "findByPk", "findByID", "findById", "findFirst", "findFirstOrThrow"]);
 
 /**
- * Aggregates are bounded by construction: `count()`, `aggregate()` and
- * `groupBy()` return a number or one row per group, never the whole table.
+ * Scalar aggregates are bounded; groupBy and aggregation pipelines can return
+ * one result per input record and still need a result cap.
  */
-const AGGREGATE_METHODS = new Set(["aggregate", "count", "countBy", "groupBy", "exists", "sum", "avg", "min", "max", "distinct"]);
+const AGGREGATE_METHODS = new Set(["count", "countBy", "exists", "sum", "avg", "min", "max"]);
 
-const PAGINATION_KEYS = new Set(["take", "limit", "skip", "cursor", "top", "first", "pageSize", "perPage", "offset", "start", "end"]);
+const PAGINATION_KEYS = new Set(["take", "limit", "top", "first", "pageSize", "perPage"]);
 
 export async function detectUnboundedReads(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -88,8 +88,8 @@ function visitNode(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
       }
     } else {
       const methodName = methodNameOf(node.expression);
-      if (isOrmCall(node, ctx) && !UNIQUE_METHODS.has(methodName) && !AGGREGATE_METHODS.has(methodName) && !isBuilderOnly(node)) {
-        const check = paginationCheck(node);
+      if (isOrmCall(node, ctx) && !UNIQUE_METHODS.has(methodName) && !AGGREGATE_METHODS.has(methodName) && !(methodName === "aggregate" && node.arguments[0] && ts.isObjectLiteralExpression(node.arguments[0])) && !isBuilderOnly(node)) {
+        const check = paginationCheck(node, ctx);
         if (check !== "bounded") {
           const unknown = check === "unknown";
           const ln = lineOf(sf, node);
@@ -255,54 +255,87 @@ function looksLikeSql(sql: string): boolean {
 
 function templateText(template: ts.TemplateExpression | ts.NoSubstitutionTemplateLiteral): string | null {
   if (ts.isNoSubstitutionTemplateLiteral(template)) return template.text;
-  return template.getText();
+  return template.head.text + template.templateSpans.map(span => " ? " + span.literal.text).join("");
 }
 
 function sqlText(arg: ts.Expression): string | null {
   if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) return arg.text;
-  if (ts.isTemplateExpression(arg)) return arg.getText();
+  if (ts.isTemplateExpression(arg)) return templateText(arg);
   return null;
 }
 
+/** Ignore SQL comments, quoted literals and nested subquery limits. */
 function hasSqlLimit(sql: string): boolean {
-  return /\blimit\b/i.test(sql) || /\btop\s+\d+\b/i.test(sql) || /\bfetch\s+first\b/i.test(sql);
+  let clean = "";
+  for (let i = 0; i < sql.length;) {
+    if (sql.startsWith("--", i)) { const end = sql.indexOf("\n", i); i = end < 0 ? sql.length : end; clean += " "; continue; }
+    if (sql.startsWith("/*", i)) {
+      let nested = 1; i += 2;
+      while (i < sql.length && nested) {
+        if (sql.startsWith("/*", i)) { nested++; i += 2; }
+        else if (sql.startsWith("*/", i)) { nested--; i += 2; }
+        else i++;
+      }
+      clean += " "; continue;
+    }
+    const quote = sql[i];
+    if (quote === "'" || quote === '"' || quote === "`") {
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === quote) { i++; if (sql[i] === quote) { i++; continue; } break; }
+        if (sql[i] === "\\") i++;
+        i++;
+      }
+      clean += " quoted_value "; continue;
+    }
+    const dollar = /^\$(?:[a-zA-Z_]\w*)?\$/.exec(sql.slice(i));
+    if (dollar) { const end = sql.indexOf(dollar[0], i + dollar[0].length); i = end < 0 ? sql.length : end + dollar[0].length; clean += " quoted_value "; continue; }
+    clean += sql[i++];
+  }
+  let depth = 0;
+  let top = "";
+  for (const char of clean) {
+    if (char === "(") { if (depth === 0) top += " () "; depth++; }
+    else if (char === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0) top += char;
+  }
+  return top.split(";").filter(statement => statement.trim()).every(statement => {
+    const select = /\bselect\b/i.exec(statement);
+    if (!select) return !/\breturning\b/i.test(statement);
+    const query = statement.slice(select.index);
+    if (!/\b(?:group\s+by|union|intersect|except)\b/i.test(query) && /^select\s+(?:count|sum|avg|min|max)\s*\(\)\s*(?:as\s+\w+\s*)?(?:from\b|$)/i.test(query)) return true;
+    return /\blimit\s+(?:\d+|\$\d+|\?)/i.test(query) || /\btop\s+\d+\b/i.test(query) || /\bfetch\s+(?:first|next)\s+\d+/i.test(query);
+  });
 }
 
 type PaginationCheck = "bounded" | "unbounded" | "unknown";
 
-function paginationCheck(node: ts.CallExpression): PaginationCheck {
-  if (hasChainedPagination(node)) return "bounded";
-  if (node.arguments.length === 0) return "unbounded";
-
-  let sawObject = false;
-  let sawScalarString = false;
-  let sawUnverifiable = false;
-
-  // Inspect every argument: Mongoose puts options in the 3rd arg, Prisma in the 1st.
-  for (const arg of node.arguments) {
-    if (ts.isObjectLiteralExpression(arg)) {
-      sawObject = true;
-      const hasKey = arg.properties.some((p) => {
-        if (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) {
-          const name = p.name.getText().replace(/['"]/g, "");
-          return PAGINATION_KEYS.has(name);
-        }
-        return false;
-      });
-      if (hasKey) return "bounded";
-    } else if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) || ts.isTemplateExpression(arg)) {
-      sawScalarString = true;
-      if (/limit/i.test(arg.getText())) return "bounded";
-    } else {
-      sawUnverifiable = true;
+function paginationCheck(node: ts.CallExpression, ctx: FileContext): PaginationCheck {
+  const chain = chainedPagination(node);
+  if (chain) return chain;
+  const method = methodNameOf(node.expression);
+  // find() filters are not option objects. Mongoose uses argument three;
+  // MongoDB uses argument two. Prisma/Sequelize use argument one.
+  const receiver = ts.isPropertyAccessExpression(node.expression) ? node.expression.expression.getText() : "";
+  const mongooseModel = isKnownModel(receiver, ctx) && !ctx.imports.has("typeorm");
+  const optionIndex = method === "find" ? mongooseModel ? 2 : ctx.imports.has("typeorm") ? 0 : 1 : 0;
+  const config = node.arguments[optionIndex];
+  if (!config || config.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(config) && config.text === "undefined")) return "unbounded";
+  if (!ts.isObjectLiteralExpression(config)) return "unknown";
+  const effective = new Map<string, ts.Expression>();
+  let unknown = false;
+  for (const property of config.properties) {
+    if (ts.isSpreadAssignment(property) || (property.name && ts.isComputedPropertyName(property.name))) {
+      effective.clear(); unknown = true; continue;
+    }
+    if (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)) {
+      const name = property.name.getText().replace(/['"]/g, "");
+      if (PAGINATION_KEYS.has(name)) effective.set(name, ts.isPropertyAssignment(property) ? property.initializer : property.name);
     }
   }
-
-  // Object args with no pagination key -> confidently unbounded.
-  if (sawObject) return "unbounded";
-  // Only opaque variables/spreads -> can't tell, do not assert unbounded.
-  if (sawUnverifiable) return "unknown";
-  // Only string/SQL arguments without LIMIT -> unbounded.
-  if (sawScalarString) return "unbounded";
-  return "unbounded";
+  for (const value of effective.values()) {
+    if (ts.isNumericLiteral(value)) { if (Number(value.text) > 0) return "bounded"; }
+    else if (value.kind !== ts.SyntaxKind.NullKeyword && !(ts.isIdentifier(value) && value.text === "undefined")) unknown = true;
+  }
+  return unknown ? "unknown" : "unbounded";
 }

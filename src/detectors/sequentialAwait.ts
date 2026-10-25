@@ -1,3 +1,4 @@
+import { isHttpFetch } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding, DB_RECEIVER } from "./common.js";
 import type { Finding } from "../types.js";
@@ -90,7 +91,7 @@ function isNetworkOrDbCall(expr: ts.Expression): boolean {
     if (found) return;
     if (ts.isCallExpression(n)) {
       const callee = n.expression;
-      if (ts.isIdentifier(callee) && (callee.text === "fetch" || callee.text === "request")) {
+      if (isHttpFetch(callee)) {
         found = true;
         return;
       }

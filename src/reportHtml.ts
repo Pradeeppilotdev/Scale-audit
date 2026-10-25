@@ -20,6 +20,9 @@ export function renderHtml(report: Report): string {
     .join("");
 
   const codemod = (report.codemod?.edits ?? [])
+    .map((e) => `<li>${esc(e.file)}:${e.line} — ${esc(e.description)}${e.safe ? "" : " <b>Review required; never auto-applied.</b>"}</li>`)
+    .join("");
+  const manual = (report.codemod?.manual ?? [])
     .map((e) => `<li>${esc(e.file)}:${e.line} — ${esc(e.description)}</li>`)
     .join("");
 
@@ -57,6 +60,7 @@ export function renderHtml(report: Report): string {
   <h1>Scale-Readiness Report</h1>
   <div class="muted">${esc(report.repo)}${report.commit ? ` @ ${esc(report.commit.slice(0, 12))}` : ""}</div>
   <div class="score">${report.score}/100</div>
+  ${report.coverage ? `<p>Source coverage: ${report.coverage.analyzed}/${report.coverage.discovered} analyzed; ${report.coverage.skipped.length} skipped.</p>${report.coverage.skipped.length || report.coverage.analyzed === 0 ? "<p><b>Incomplete source coverage. This score applies only to analyzed files.</b></p>" : ""}<ul>${report.coverage.skipped.map((s) => `<li>Skipped ${esc(s.file)}: ${esc(s.reason)}</li>`).join("")}</ul>` : ""}
   <div class="muted">Scanned ${esc(report.scannedAt)} · ${report.fingerprint.sourceFileCount} source files · ${esc(report.fingerprint.framework ?? "unknown framework")}${report.fingerprint.projectType !== "unknown" ? ` · ${esc(report.fingerprint.projectType)}` : ""}</div>
   ${
     report.firstBottleneck
@@ -72,7 +76,7 @@ export function renderHtml(report: Report): string {
   <h2>Findings (${report.findings.length})</h2>
   ${findings || "<p class='muted'>No findings.</p>"}
   ${report.findings.length > shown.length ? `<p class="muted">Showing the first ${shown.length} of ${report.findings.length} findings. Use the JSON output for the full list.</p>` : ""}
-  ${codemod ? `<h2>Automated fixes (${report.codemod?.patched})</h2><ul>${codemod}</ul>` : ""}
+  ${report.codemod ? `<h2>Fix suggestions</h2><p>${report.codemod.patched} generated; ${report.codemod.appliedEdits ?? 0} edits applied; ${report.codemod.unpatched} sites need manual repair.</p>${codemod ? `<ul>${codemod}</ul>` : ""}${manual ? `<h3>Manual fixes</h3><ul>${manual}</ul>` : ""}` : ""}
   ${report.notes.length ? `<h2>Notes</h2><ul>${report.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}
   <h2>What we could not verify</h2>
   <ul class="muted">

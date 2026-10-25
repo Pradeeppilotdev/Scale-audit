@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
+import { isRecord, parseRepoManifest, readRepoFile } from "../repoFiles.js";
+import { isAxiosBinding, isHttpFetch } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
@@ -40,11 +40,11 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
 
-  let pkg: any = {};
-  try {
-    pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
-  } catch {}
-  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+  const pkg = parseRepoManifest(await readRepoFile(root, "package.json"));
+  const deps = {
+    ...(isRecord(pkg.dependencies) ? pkg.dependencies : {}),
+    ...(isRecord(pkg.devDependencies) ? pkg.devDependencies : {}),
+  };
 
   const hasOutboundCalls = workspace.units.some((u) => hasOutboundCall(u.sf));
   if (hasOutboundCalls) {
@@ -108,11 +108,11 @@ function hasOutboundCall(sf: ts.SourceFile): boolean {
     if (found) return;
     if (ts.isCallExpression(node)) {
       const expr = node.expression;
-      if (ts.isIdentifier(expr) && expr.text === "fetch") {
+      if (isHttpFetch(expr)) {
         found = true;
         return;
       }
-      if (ts.isPropertyAccessExpression(expr) && expr.expression.getText() === "axios") {
+      if (ts.isPropertyAccessExpression(expr) && isAxiosBinding(expr.expression)) {
         found = true;
         return;
       }
@@ -129,11 +129,11 @@ function firstOutboundCall(sf: ts.SourceFile): ts.Node {
     if (found !== sf) return;
     if (ts.isCallExpression(node)) {
       const expr = node.expression;
-      if (ts.isIdentifier(expr) && expr.text === "fetch") {
+      if (isHttpFetch(expr)) {
         found = node;
         return;
       }
-      if (ts.isPropertyAccessExpression(expr) && expr.expression.getText() === "axios") {
+      if (ts.isPropertyAccessExpression(expr) && isAxiosBinding(expr.expression)) {
         found = node;
         return;
       }

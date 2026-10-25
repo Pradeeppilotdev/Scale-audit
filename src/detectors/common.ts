@@ -1,57 +1,27 @@
-import { readFile, lstat } from "node:fs/promises";
-import path from "node:path";
-import { glob } from "glob";
+import { readRepoFile, walkRepo } from "../repoFiles.js";
 import ts from "typescript";
 import type { Finding } from "../types.js";
 import type { FileContext } from "../context.js";
 import { lastSegment } from "../context.js";
 
 export async function listSourceFiles(root: string): Promise<string[]> {
-  const files = await glob("**/*.{ts,tsx,js,jsx,mjs,cjs}", {
-    cwd: root,
-    ignore: [
-      "**/node_modules/**",
-      "**/dist/**",
-      "**/build/**",
-      "**/.git/**",
-      "**/coverage/**",
-      "**/.next/**",
-      "**/.nuxt/**",
-      "**/.svelte-kit/**",
-      "**/.turbo/**",
-      "**/.vercel/**",
-      "**/.output/**",
-      "**/.cache/**",
-      "**/.venv/**",
-      "**/venv/**",
-      "**/*.d.ts",
-      "**/test/**",
-      "**/tests/**",
-      "**/__tests__/**",
-      "**/*.test.*",
-      "**/*.spec.*",
-      "**/examples/**",
-      "**/example/**",
-      "**/docs/**",
-      "**/benchmarks/**",
-      "**/sandbox/**",
-    ],
-    nodir: true,
-    absolute: false,
-    follow: false,
-  });
-  return files.sort().slice(0, 20_000);
+  const ignoredDirs = new Set([
+    "node_modules", "dist", "build", "coverage", "venv", "test", "tests", "__tests__",
+    "examples", "example", "docs", "benchmarks", "sandbox",
+  ]);
+  const files: string[] = [];
+  for await (const { rel, directory } of walkRepo(root, {
+    ignore: (rel, directory) => (directory && ignoredDirs.has(rel.split("/").at(-1)!)) || /\.(test|spec)\./.test(rel),
+  })) {
+    if (directory || !/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(rel) || /\.d\.(?:ts|mts|cts)$/.test(rel)) continue;
+    files.push(rel);
+    if (files.length > 20_000) throw new Error("Repository source file count exceeds limit of 20000");
+  }
+  return files.sort();
 }
 
 export async function readFileSafe(root: string, rel: string): Promise<string | null> {
-  try {
-    const full = path.join(root, rel);
-    const st = await lstat(full);
-    if (st.isSymbolicLink() || st.size > 1_000_000) return null;
-    return await readFile(full, "utf8");
-  } catch {
-    return null;
-  }
+  return readRepoFile(root, rel);
 }
 
 export function parseSource(rel: string, content: string): ts.SourceFile | null {
@@ -91,26 +61,35 @@ export function makeFinding(partial: Omit<Finding, "snippet"> & { snippet?: stri
   return { snippet: "", ...partial };
 }
 
-const PAGINATION_CHAIN = new Set(["limit", "take", "skip", "first", "top", "last", "offset", "page", "perPage"]);
+const PAGINATION_CHAIN = new Set(["limit", "take", "first", "top", "last", "perPage"]);
 
-/** True when a query call is chained with pagination helpers, e.g. Model.find().limit(10). */
-export function hasChainedPagination(node: ts.CallExpression): boolean {
-  let cur: ts.Node = node;
-  while (cur.parent) {
-    const p = cur.parent;
-    if (ts.isPropertyAccessExpression(p) && p.expression === cur) {
-      if (PAGINATION_CHAIN.has(p.name.getText())) return true;
-      cur = p;
-    } else if (ts.isCallExpression(p) && p.expression === cur) {
-      cur = p;
-    } else {
-      break;
-    }
+/** Inspect the outermost cap first so later chained overrides win. */
+export function chainedPagination(node: ts.CallExpression): "bounded" | "unbounded" | "unknown" | undefined {
+  let outer: ts.Node = node;
+  while (outer.parent && ((ts.isPropertyAccessExpression(outer.parent) && outer.parent.expression === outer)
+    || (ts.isCallExpression(outer.parent) && outer.parent.expression === outer))) outer = outer.parent;
+  let current: ts.Node = outer;
+  while (ts.isCallExpression(current) || ts.isPropertyAccessExpression(current)) {
+    if (ts.isCallExpression(current)) {
+      const expression = current.expression;
+      if (ts.isPropertyAccessExpression(expression) && PAGINATION_CHAIN.has(expression.name.text)) {
+        const value = current.arguments[0];
+        if (!value || value.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(value) && value.text === "undefined")) return "unbounded";
+        return ts.isNumericLiteral(value) ? Number(value.text) > 0 ? "bounded" : "unbounded" : "unknown";
+      }
+      current = expression;
+    } else current = current.expression;
   }
-  return false;
+  return undefined;
+}
+
+export function hasChainedPagination(node: ts.CallExpression): boolean {
+  return chainedPagination(node) === "bounded";
 }
 
 const STRONG_ORM_METHODS = new Set([
+  "select",
+  "all",
   "findMany",
   "findAll",
   "findUnique",
@@ -153,6 +132,13 @@ export function isOrmCall(node: ts.CallExpression, ctx?: FileContext): boolean {
   if (!ts.isPropertyAccessExpression(node.expression)) return false;
   const methodName = node.expression.name.getText();
   const receiver = node.expression.expression.getText();
+  if (methodName === "select" || methodName === "all") {
+    const root = /^[A-Za-z_$][\w$]*/.exec(receiver)?.[0];
+    const importedDb = root && ctx && [...ctx.imports].some(([module, bindings]) =>
+      /^(?:knex|drizzle-orm(?:\/.*)?|kysely|@prisma\/client)$/.test(module) && bindings.has(root));
+    if (!DB_RECEIVER.test(receiver) && !importedDb) return false;
+  }
+
 
   const strong = STRONG_ORM_METHODS.has(methodName);
   const ambiguous = AMBIGUOUS_ORM_METHODS.has(methodName);

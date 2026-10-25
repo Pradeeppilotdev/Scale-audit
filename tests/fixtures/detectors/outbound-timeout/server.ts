@@ -1,8 +1,4 @@
-const axios = {
-  get: (...args: unknown[]) => args,
-  post: (...args: unknown[]) => args,
-  create: (config: unknown) => ({ get: (...args: unknown[]) => [config, ...args] }),
-} as any;
+import axios from "axios";
 
 export async function noTimeoutFetch(url: string) {
   return fetch(url);

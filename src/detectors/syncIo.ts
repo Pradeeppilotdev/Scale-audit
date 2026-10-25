@@ -1,3 +1,5 @@
+import { executionContexts, type ExecutionContext } from "../executionContext.js";
+import { importedBinding } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
@@ -31,13 +33,15 @@ const IMAGE_LIBS = /\b(?:sharp|jimp|gm)\s*\(|\bimagemagick\b\s*[.(]/;
 export async function detectSyncIo(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
+  const contexts = await executionContexts(root, workspace, isRequestPath);
   for (const unit of workspace.units) {
     const { rel, content, sf } = unit;
 
     const isScript = /(^|\/)(scripts?|tools?|bin|seed|migrations?|fixtures?|examples?)\//i.test(rel) || /\.config\.|webpack\.config|rollup\.config|vite\.config/i.test(rel);
-    const hotPath = isRequestPath(rel) && !isScript;
+    const context = contexts.get(rel);
+    const hotPath = context?.request ?? false;
 
-    visitSync(sf, sf, content, rel, out, hotPath, isScript);
+    visitSync(sf, sf, content, rel, out, hotPath, isScript, context);
 
     if (IMAGE_LIBS.test(content) && hotPath) {
       const ln = findLine(content, IMAGE_LIBS);
@@ -62,25 +66,37 @@ export async function detectSyncIo(root: string, ws?: Workspace): Promise<Findin
   return out;
 }
 
-function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[], hotPath: boolean, isScript: boolean) {
+function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[], hotPath: boolean, isScript: boolean, context?: ExecutionContext) {
   if (ts.isCallExpression(node)) {
-    const name =
+    let name =
       ts.isPropertyAccessExpression(node.expression) ? node.expression.name.getText() : ts.isIdentifier(node.expression) ? node.expression.text : "";
+    const imported = importedBinding(node.expression);
+    if (imported && /^(node:)?(fs(?:\/promises)?|child_process|crypto|zlib)$/.test(imported.module)) name = imported.name;
     if (SYNC_BLOCKING.has(name) || /(FileSync|DirSync)$/.test(name)) {
       const ln = lineOf(sf, node);
       const inFunction = isInsideFunction(node);
       const startup = !inFunction && !isScript;
-      const severity = isScript || startup ? "low" : hotPath ? "high" : "medium";
-      const confidence = isScript || startup ? "low" : hotPath ? "medium" : "low";
-      const message = startup
+      const isolated = !hotPath && (context?.cli || context?.worker);
+      const label = context?.cli && context?.worker ? "CLI/isolated worker" : context?.worker ? "isolated worker" : "CLI";
+      const severity = isolated ? "info" : startup ? "low" : hotPath ? "high" : isScript ? "low" : "medium";
+      const confidence = isolated ? "medium" : startup ? "low" : hotPath ? "medium" : "low";
+      const message = isolated
+        ? `Synchronous call "${name}" runs in ${label} code (based on module reachability).`
+        : startup
         ? `Synchronous call "${name}" runs at module scope (startup/config).`
         : `Synchronous call "${name}" blocks the event loop.`;
-      const scaleTrigger = isScript
+      const scaleTrigger = isolated
+        ? "Blocks this CLI/worker execution; no request-entry import path was found in the analyzed source. Slow storage can still delay the audit."
+        : hotPath && !startup
+          ? "This module is reachable from a request entry; synchronous I/O can stall concurrent requests."
+          : isScript
         ? "Script sync call; not a runtime bottleneck unless run in a request path."
         : startup
           ? "Startup sync call; fine once at boot, dangerous if imported into a request path."
           : "Under concurrency, sync calls stall all requests.";
-      const suggestedFix = isScript || startup
+      const suggestedFix = isolated
+        ? "Keep safety checks intact. Optimize only if profiling shows a bottleneck; reassess if this code is imported into a request handler."
+        : (isScript && !hotPath) || startup
         ? "Keep at startup only; never call from request handlers."
         : "Replace with the async equivalent and ensure the hot path stays non-blocking.";
       out.push(
@@ -99,7 +115,7 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
       );
     }
   }
-  ts.forEachChild(node, (c) => visitSync(c, sf, content, rel, out, hotPath, isScript));
+  ts.forEachChild(node, (c) => visitSync(c, sf, content, rel, out, hotPath, isScript, context));
 }
 
 function isInsideFunction(node: ts.Node): boolean {

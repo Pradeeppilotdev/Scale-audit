@@ -1,3 +1,4 @@
+import { definitionOf, isHttpFetch, symbolOf } from "./bindings.js";
 import ts from "typescript";
 import type { FileContext } from "./context.js";
 import { DB_WRITE_RECEIVER } from "./detectors/common.js";
@@ -56,14 +57,15 @@ export function isDbWriteCall(node: ts.CallExpression, ctx?: FileContext): boole
 
 /** True when the call expression is known to return a promise. */
 export function isPromiseProducingCall(node: ts.CallExpression, ctx?: FileContext): boolean {
+  if (isHttpFetch(node.expression)) return true;
   if (ts.isIdentifier(node.expression)) {
     // `fetch` always returns a promise.
-    return node.expression.text === "fetch";
+    return isHttpFetch(node.expression);
   }
   if (!ts.isPropertyAccessExpression(node.expression)) return false;
   const method = node.expression.name.getText();
   if (method === "then" || method === "catch" || method === "finally") return false;
-  if (method === "fetch") return true;
+  if (method === "fetch") return isHttpFetch(node.expression);
   if (PROMISE_CALL_NAMES.has(method)) return isDbWriteCall(node, ctx);
   return false;
 }
@@ -98,37 +100,41 @@ export function isFloatingPromise(stmt: ts.Statement, ctx?: FileContext): ts.Cal
   return expr;
 }
 
-/** True when a `.then()` chain has no rejection handler. */
-export function isUnhandledRejection(stmt: ts.Statement): ts.CallExpression | null {
-  if (!ts.isExpressionStatement(stmt)) return null;
-  const expr = stmt.expression;
-  if (!ts.isCallExpression(expr)) return null;
-  if (!ts.isPropertyAccessExpression(expr.expression)) return null;
-  if (expr.expression.name.getText() !== "then") return null;
-  // `then(onFulfilled, onRejected)` handles the rejection already.
-  if (expr.arguments.length >= 2) return null;
-  // `Promise.resolve().then(...)` cannot reject on the source side.
-  const source = expr.expression.expression;
-  if (ts.isCallExpression(source) && ts.isPropertyAccessExpression(source.expression)) {
-    if (source.expression.expression.getText() === "Promise") {
-      const method = source.expression.name.getText();
-      if (method === "resolve" || method === "reject") return null;
-    }
-  }
+function callableHandler(node: ts.Expression | undefined): boolean {
+  return !!node && (ts.isArrowFunction(node) || ts.isFunctionExpression(node)
+    || (ts.isIdentifier(node) && node.text !== "undefined") || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node));
+}
 
-  let cur: ts.Node = expr;
-  while (cur.parent) {
-    const p = cur.parent;
-    if (ts.isPropertyAccessExpression(p) && p.expression === cur) {
-      if (p.name.getText() === "catch" || p.name.getText() === "finally") return null;
-      cur = p;
-      continue;
-    }
-    if (ts.isCallExpression(p) && p.expression === cur) {
-      cur = p;
-      continue;
-    }
-    break;
+/** Follow known promise origins, rather than unrelated synchronous then/finally methods. */
+function isPromiseValue(node: ts.Expression, seen = new Set<ts.Node>()): boolean {
+  if (seen.has(node) || seen.size > 64) return false;
+  const next = new Set(seen).add(node);
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) return isPromiseValue(node.expression, next);
+  if (ts.isIdentifier(node)) {
+    const declaration = definitionOf(node);
+    return !!declaration && ts.isVariableDeclaration(declaration) && !!declaration.initializer && isPromiseValue(declaration.initializer, next);
   }
-  return expr;
+  if (ts.isNewExpression(node)) return ts.isIdentifier(node.expression) && node.expression.text === "Promise" && !symbolOf(node.expression)?.declarations?.length;
+  if (!ts.isCallExpression(node)) return false;
+  if (isPromiseProducingCall(node)) return true;
+  const definition = definitionOf(node.expression);
+  if (definition && ts.canHaveModifiers(definition) && ts.getModifiers(definition)?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword)) return true;
+  if (!ts.isPropertyAccessExpression(node.expression)) return false;
+  const { expression: receiver, name } = node.expression;
+  if (ts.isIdentifier(receiver) && receiver.text === "Promise" && !symbolOf(receiver)?.declarations?.length && ["resolve", "reject", "all", "allSettled", "race", "any"].includes(name.text)) return true;
+  return ["then", "catch", "finally"].includes(name.text) && isPromiseValue(receiver, next);
+}
+
+/** A discarded rejection or chain without an effective rejection handler. */
+export function isUnhandledRejection(stmt: ts.Statement): ts.CallExpression | null {
+  if (!ts.isExpressionStatement(stmt) || !ts.isCallExpression(stmt.expression)) return null;
+  const call = stmt.expression;
+  if (!ts.isPropertyAccessExpression(call.expression)) return null;
+  const method = call.expression.name.text;
+  const receiver = call.expression.expression;
+  if (method === "reject" && ts.isIdentifier(receiver) && receiver.text === "Promise" && !symbolOf(receiver)?.declarations?.length) return call;
+  if (!["catch", "then", "finally"].includes(method) || !isPromiseValue(receiver)) return null;
+  if (method === "catch") return callableHandler(call.arguments[0]) ? null : call;
+  if (method === "then") return callableHandler(call.arguments[1]) ? null : call;
+  return call;
 }

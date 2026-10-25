@@ -46,18 +46,40 @@ test("--diff prints a unified diff with automated fixes and never touches the re
   assert.ok(after.findings.some((f) => f.id === "unbounded-read"), "fixture should still have unbounded reads");
 });
 
-test("--fix applies automated fixes in place", () => {
+test("--fix leaves pagination suggestions for review", () => {
   const unbounded = path.join(root, "tests", "fixtures", "unboundedapp");
   const copy = fs.mkdtempSync(path.join(os.tmpdir(), "scale-audit-fix-"));
   try {
     fs.cpSync(unbounded, copy, { recursive: true });
+    const source = path.join(copy, "src", "server.js");
+    const before = fs.readFileSync(source, "utf8");
     const r = spawnSync(process.execPath, [cli, copy, "--fix"], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
-    const patched = fs.readFileSync(path.join(copy, "src", "server.js"), "utf8");
-    assert.match(patched, /take: 50/, "expected pagination to be injected");
-    // And the finding should be gone after the fix.
+    assert.equal(fs.readFileSync(source, "utf8"), before, "pagination changes require review");
+    const generated = JSON.parse(r.stdout).codemod;
+    assert.equal(generated.applied, false);
+    assert.equal(generated.appliedEdits, 0);
+    assert.ok(generated.edits.some((edit) => !edit.safe));
+    assert.match(r.stderr, /review-required suggestions were not applied/);
     const after = JSON.parse(spawnSync(process.execPath, [cli, copy], { encoding: "utf8" }).stdout);
-    assert.ok(!after.findings.some((f) => f.id === "unbounded-read"), "unbounded read should be resolved");
+    assert.ok(after.findings.some((f) => f.id === "unbounded-read"));
+  } finally {
+    fs.rmSync(copy, { recursive: true, force: true });
+  }
+});
+
+test("--fix applies a safe fetch timeout in place", () => {
+  const copy = fs.mkdtempSync(path.join(os.tmpdir(), "scale-audit-fetch-fix-"));
+  try {
+    fs.writeFileSync(path.join(copy, "package.json"), JSON.stringify({ name: "fetch-app", dependencies: { express: "5.0.0" } }));
+    fs.writeFileSync(path.join(copy, "server.js"), 'export async function load() { return fetch("https://example.com"); }\n');
+    const r = spawnSync(process.execPath, [cli, copy, "--fix"], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(fs.readFileSync(path.join(copy, "server.js"), "utf8"), /signal: AbortSignal\.timeout\(5000\)/);
+    const report = JSON.parse(r.stdout);
+    assert.deepEqual(report.codemod.files, ["server.js"]);
+    assert.equal(report.codemod.applied, true);
+    assert.equal(report.codemod.appliedEdits, 1);
   } finally {
     fs.rmSync(copy, { recursive: true, force: true });
   }
@@ -96,6 +118,7 @@ test("score is family-capped so one repeated issue class does not zero it out", 
   const report = JSON.parse(r.stdout);
   assert.equal(report.findings.length, 12, "expected 12 sync-io findings");
   assert.ok(report.findings.every((f) => f.id === "sync-io"));
-  // 12 high-severity findings = 120 raw penalty, capped at 20 for the family -> 80.
-  assert.equal(report.score, 80);
+  // Category penalties stay capped; all nine categories form the fixed baseline.
+  assert.equal(report.summary.categories.find(c => c.category === "I/O").score, 80);
+  assert.equal(report.score, 98);
 });

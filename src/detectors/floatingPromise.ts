@@ -60,7 +60,7 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, c
           confidence: "medium",
           file: rel,
           line: ln,
-          message: "Promise chain uses `.then()` without a `.catch()`; a rejection will become an unhandled rejection.",
+          message: "Promise chain is discarded without a rejection handler; a failure can become an unhandled rejection.",
           scaleTrigger: "One failed downstream call can crash the whole process instead of failing a single request.",
           suggestedFix: "Add a `.catch()` handler (or use `await` in a try/catch) so failures are contained.",
           snippet: snippetAt(content, ln),

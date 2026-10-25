@@ -1,21 +1,18 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { glob } from "glob";
+import {
+  MAX_MANIFEST_BYTES, RepoInputBudget, isRecord, parseRepoManifest, readRepoFile, repoPathExists, walkRepo,
+} from "./repoFiles.js";
 import type { Fingerprint, ProjectType } from "./types.js";
 import { listSourceFiles } from "./detectors/common.js";
 
-export async function fingerprintRepo(root: string): Promise<Fingerprint> {
-  const pkgPath = path.join(root, "package.json");
-  let pkg: any = {};
-  try {
-    pkg = JSON.parse(await readFile(pkgPath, "utf8"));
-  } catch {
-    pkg = {};
-  }
+export async function fingerprintRepo(root: string, sourceFile?: string): Promise<Fingerprint> {
+  const budget = new RepoInputBudget("manifest", MAX_MANIFEST_BYTES);
+  const rootContent = await readRepoFile(root, "package.json");
+  if (rootContent !== null) budget.add(rootContent);
+  const pkg = parseRepoManifest(rootContent);
 
   // Monorepos keep the interesting dependencies in workspace packages, so
   // every package.json in the repo is folded in.
-  const workspacePkgs = await readWorkspacePackages(root);
+  const workspacePkgs = await readWorkspacePackages(root, budget);
   const deps = mergeDeps([pkg, ...workspacePkgs], "dependencies");
   const devDeps = mergeDeps([pkg, ...workspacePkgs], "devDependencies");
   const allDeps = { ...deps, ...devDeps };
@@ -23,12 +20,12 @@ export async function fingerprintRepo(root: string): Promise<Fingerprint> {
   const framework = detectFramework(allDeps);
   const orm = detectOrm(allDeps);
 
-  const sourceFiles = await listSourceFiles(root);
+  const sourceFiles = sourceFile ? [sourceFile] : await listSourceFiles(root);
 
   const hasTests =
     (await hasTestFiles(root)) ||
     Boolean(devDeps.jest || devDeps.vitest || devDeps.mocha || devDeps["node-tap"] || deps["@jest/globals"]);
-  const hasCI = (await exists(path.join(root, ".github", "workflows"))) || (await exists(path.join(root, ".gitlab-ci.yml")));
+  const hasCI = repoPathExists(root, ".github/workflows", true) || repoPathExists(root, ".gitlab-ci.yml");
 
   return {
     framework,
@@ -37,54 +34,39 @@ export async function fingerprintRepo(root: string): Promise<Fingerprint> {
     hasCI,
     deps,
     devDeps,
-    fileCount: await countAllFiles(root),
+    fileCount: sourceFile ? 1 : await countAllFiles(root),
     sourceFileCount: sourceFiles.length,
-    projectType: detectProjectType(pkg, pkg.dependencies ?? {}),
+    projectType: detectProjectType(pkg, mergeDeps([pkg], "dependencies")),
   };
 }
 
 /** Every package.json in the repo except the root one. */
-async function readWorkspacePackages(root: string): Promise<any[]> {
-  const files = await glob("**/package.json", {
-    cwd: root,
-    // Test fixtures contain their own package.json files with their own
-    // dependencies; they must not be mistaken for the project's dependencies.
-    ignore: [
-      "**/node_modules/**",
-      "**/dist/**",
-      "**/build/**",
-      "**/.git/**",
-      "**/coverage/**",
-      "**/test/**",
-      "**/tests/**",
-      "**/__tests__/**",
-      "**/*.test.*",
-      "**/*.spec.*",
-      "**/fixtures/**",
-      "**/__fixtures__/**",
-      "**/examples/**",
-      "**/example/**",
-      "**/docs/**",
-    ],
-    nodir: true,
-  });
-  const pkgs: any[] = [];
-  for (const f of files) {
-    if (f === "package.json") continue;
-    try {
-      pkgs.push(JSON.parse(await readFile(path.join(root, f), "utf8")));
-    } catch {
-      // ignore unreadable manifests
-    }
+async function readWorkspacePackages(root: string, budget: RepoInputBudget): Promise<Record<string, unknown>[]> {
+  // Fixtures and examples must not contribute dependencies to the audited project.
+  const ignored = new Set([
+    "node_modules", "dist", "build", "coverage", "test", "tests", "__tests__", "fixtures",
+    "__fixtures__", "examples", "example", "docs",
+  ]);
+  const pkgs: Record<string, unknown>[] = [];
+  let count = 0;
+  for await (const { rel, directory } of walkRepo(root, {
+    ignore: (rel, directory) => (directory && ignored.has(rel.split("/").at(-1)!)) || /\.(test|spec)\./.test(rel),
+  })) {
+    if (directory || rel === "package.json" || !rel.endsWith("/package.json")) continue;
+    if (++count > 2_000) throw new Error("Repository workspace manifest count exceeds limit of 2000");
+    const content = await readRepoFile(root, rel);
+    if (content === null) continue;
+    budget.add(content);
+    pkgs.push(parseRepoManifest(content));
   }
   return pkgs;
 }
 
-function mergeDeps(pkgs: any[], key: "dependencies" | "devDependencies"): Record<string, string> {
-  const out: Record<string, string> = {};
+function mergeDeps(pkgs: Record<string, unknown>[], key: "dependencies" | "devDependencies"): Record<string, string> {
+  const out: Record<string, string> = Object.create(null);
   for (const p of pkgs) {
     const section = p?.[key];
-    if (!section || typeof section !== "object") continue;
+    if (!isRecord(section)) continue;
     for (const [name, version] of Object.entries(section)) {
       if (typeof version === "string") out[name] = version;
     }
@@ -105,7 +87,7 @@ const SERVER_FRAMEWORKS = ["express", "fastify", "next", "@nestjs/core", "koa", 
  * commonly has a server framework in its devDependencies for benchmarks, and
  * a monorepo's workspace packages are not what the root package is.
  */
-function detectProjectType(pkg: any, runtimeDeps: Record<string, string>): ProjectType {
+function detectProjectType(pkg: Record<string, unknown>, runtimeDeps: Record<string, string>): ProjectType {
   if (SERVER_FRAMEWORKS.some((f) => f in runtimeDeps)) return "application";
   if (pkg?.private === true) return "application";
   // A CLI is deployed and run, not consumed as a library.
@@ -135,14 +117,6 @@ function detectOrm(deps: Record<string, string>): string | null {
   return null;
 }
 
-async function exists(p: string) {
-  try {
-    await (await import("node:fs/promises")).stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Does the repo have tests?
@@ -151,17 +125,21 @@ async function exists(p: string) {
  * have to be looked up separately.
  */
 async function hasTestFiles(root: string): Promise<boolean> {
-  const files = await glob("**/*.{test,spec}.{ts,tsx,js,jsx,mjs,cjs}", {
-    cwd: root,
-    ignore: ["**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**", "**/coverage/**"],
-    nodir: true,
-  });
-  if (files.length > 0) return true;
-  const dirs = await glob("**/{test,tests,__tests__}/", { cwd: root, ignore: ["**/node_modules/**", "**/dist/**", "**/.git/**"], nodir: false });
-  return dirs.length > 0;
+  for await (const { rel, directory } of walkRepo(root, {
+    ignore: (rel, directory) => directory && ["node_modules", "dist"].includes(rel.split("/").at(-1)!),
+  })) {
+    if (directory && ["test", "tests", "__tests__"].includes(rel.split("/").at(-1)!)) return true;
+    if (!directory && /\.(test|spec)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(rel) && !rel.split("/").some((part) => ["build", "coverage"].includes(part))) return true;
+  }
+  return false;
 }
 
 async function countAllFiles(root: string): Promise<number> {
-  const files = await glob("**/*", { cwd: root, ignore: ["**/node_modules/**", "**/.git/**"], nodir: true });
-  return files.length;
+  let count = 0;
+  for await (const { directory } of walkRepo(root, {
+    ignore: (rel, directory) => directory && rel.split("/").at(-1) === "node_modules",
+  })) {
+    if (!directory) count++;
+  }
+  return count;
 }

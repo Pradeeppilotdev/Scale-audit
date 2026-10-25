@@ -1,11 +1,12 @@
-import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { glob } from "glob";
+import { MAX_MANIFEST_BYTES, MAX_SCHEMA_BYTES, RepoInputBudget, readRepoFile, repoPathExists, walkRepo } from "./repoFiles.js";
 
 export interface PrismaModel {
   name: string;
   /** Fields that can serve as a standalone index for a single-column filter. */
   indexed: Set<string>;
+  /** Scalar schema fields, used to distinguish filters from relation objects. */
+  scalarFields?: Set<string>;
 }
 
 export interface SchemaGroups {
@@ -16,17 +17,24 @@ export interface SchemaGroups {
 }
 
 export async function loadSchemaGroups(root: string): Promise<SchemaGroups> {
-  const files = await glob("**/*.prisma", {
-    cwd: root,
-    ignore: ["**/node_modules/**", "**/.venv/**", "**/venv/**"],
-    nodir: true,
-  });
+  const files: string[] = [];
+  for await (const { rel, directory } of walkRepo(root, {
+    ignore: (rel, directory) => directory && ["node_modules", "venv"].includes(rel.split("/").at(-1)!),
+  })) {
+    if (!directory && rel.endsWith(".prisma")) {
+      files.push(rel);
+      if (files.length > 1_000) throw new Error("Repository schema file count exceeds limit of 1000");
+    }
+  }
   const global = new Map<string, PrismaModel>();
   const byProject = new Map<string, Map<string, PrismaModel>>();
   const dirCache = new Map<string, string | null>();
 
+  const budget = new RepoInputBudget("schema", MAX_SCHEMA_BYTES);
   for (const f of files) {
-    const content = await readFile(path.join(root, f), "utf8").catch(() => "");
+    const content = await readRepoFile(root, f);
+    if (content === null) continue;
+    budget.add(content);
     const models = parseModels(content);
     if (models.size === 0) continue;
 
@@ -52,8 +60,11 @@ export function parseModels(content: string): Map<string, PrismaModel> {
   const blocks = [...content.matchAll(/model\s+(\w+)\s*\{([\s\S]*?)\n\}/g)];
   for (const [, name, body] of blocks) {
     const indexed = new Set<string>();
+    const scalarFields = new Set<string>();
     for (const line of body.split("\n")) {
       const trimmed = line.trim();
+      const field = /^(\w+)\s+(?:String|Int|BigInt|Float|Decimal|Boolean|DateTime|Bytes|Json)(?:[?\[\]]*)\b/.exec(trimmed);
+      if (field) scalarFields.add(field[1]);
       const idm = trimmed.match(/^(\w+)\s+\w+.*@id\b/);
       if (idm) indexed.add(idm[1]);
       const unm = trimmed.match(/^(\w+)\s+\w+.*@unique\b/);
@@ -66,7 +77,7 @@ export function parseModels(content: string): Map<string, PrismaModel> {
         if (fields.length > 0) indexed.add(fields[0]);
       }
     }
-    models.set(name.toLowerCase(), { name, indexed });
+    models.set(name.toLowerCase(), { name, indexed, scalarFields });
   }
   return models;
 }
@@ -74,15 +85,24 @@ export function parseModels(content: string): Map<string, PrismaModel> {
 export function mergeModel(target: Map<string, PrismaModel>, key: string, model: PrismaModel): void {
   const existing = target.get(key);
   if (!existing) {
-    target.set(key, { name: model.name, indexed: new Set(model.indexed) });
+    target.set(key, { name: model.name, indexed: new Set(model.indexed), scalarFields: new Set(model.scalarFields) });
     return;
   }
+  for (const field of model.scalarFields ?? []) existing.scalarFields?.add(field);
   for (const field of model.indexed) existing.indexed.add(field);
 }
 
+const projectManifestBudgets = new WeakMap<Map<string, string | null>, RepoInputBudget>();
+
 /** Nearest ancestor dir (relative to root) that contains a package.json, or null. */
 export async function findProjectDir(root: string, dir: string, cache: Map<string, string | null>): Promise<string | null> {
+  if (dir !== "" && dir !== "." && !repoPathExists(root, dir, true)) return null;
   if (cache.has(dir)) return cache.get(dir) ?? null;
+  let budget = projectManifestBudgets.get(cache);
+  if (!budget) {
+    budget = new RepoInputBudget("project manifest", MAX_MANIFEST_BYTES);
+    projectManifestBudgets.set(cache, budget);
+  }
   const trail: string[] = [];
   let cur = dir === "." ? "" : dir;
   let result: string | null = null;
@@ -94,7 +114,9 @@ export async function findProjectDir(root: string, dir: string, cache: Map<strin
       break;
     }
     trail.push(cur);
-    if (await exists(path.join(root, cur, "package.json"))) {
+    const manifest = await readRepoFile(root, cur ? `${cur}/package.json` : "package.json");
+    if (manifest !== null) {
+      budget.add(manifest);
       result = cur;
       break;
     }
@@ -105,13 +127,4 @@ export async function findProjectDir(root: string, dir: string, cache: Map<strin
 
   for (const t of trail) cache.set(t, result);
   return result;
-}
-
-async function exists(p: string): Promise<boolean> {
-  try {
-    await stat(p);
-    return true;
-  } catch {
-    return false;
-  }
 }

@@ -1,5 +1,8 @@
+import { checkerFor, isAxiosBinding, isHttpFetch } from "./bindings.js";
 import ts from "typescript";
-import { readFileSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, realpathSync, writeSync } from "node:fs";
+import path from "node:path";
+import { readRepoFileSync } from "./repoFiles.js";
 import type { Finding } from "./types.js";
 import { isDbWriteCall } from "./signals.js";
 
@@ -24,7 +27,7 @@ export interface CodemodFilePlan {
 export interface CodemodPlan {
   /** Per-file result of the plan. */
   files: CodemodFilePlan[];
-  /** Number of findings that produced a patch. */
+  /** Number of findings that produced a suggestion (including review-required patches). */
   patched: number;
   /** Number of findings we could not turn into a patch. */
   unpatched: number;
@@ -54,8 +57,8 @@ interface PositionalEdit {
  * reporting how many findings disappeared after a blind patch, we produce the
  * actual diff a developer can review and apply.
  *
- * Every patch is anchored to an exact AST offset rather than a regular
- * expression, so the result is syntactically valid code.
+ * Findings only identify a line: ambiguous candidates are left for manual
+ * repair. Accepted patches use AST offsets and pass syntax validation.
  */
 export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
   const byFile = new Map<string, Finding[]>();
@@ -72,18 +75,11 @@ export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
   let unpatched = 0;
 
   for (const [rel, fileFindings] of byFile) {
-    const full = pathJoin(root, rel);
-    let content: string;
-    try {
-      content = readFileSync(full, "utf8");
-    } catch {
+    const content = readRepoFileSync(root, rel);
+    const sf = content === null ? null : parse(rel, content);
+    if (content === null || !sf) {
       unpatched += fileFindings.length;
-      continue;
-    }
-
-    const sf = parse(rel, content);
-    if (!sf) {
-      unpatched += fileFindings.length;
+      manual.push(...fileFindings.map((f) => manualEdit(f)));
       continue;
     }
 
@@ -93,16 +89,16 @@ export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
       const edit = planEdit(sf, f);
       if (!edit) {
         unpatched++;
-        manual.push({
-          findingId: f.id,
-          file: rel,
-          line: f.line,
-          description: "No safe automatic patch could be generated for this site; apply the suggested fix by hand.",
-          safe: false,
-        });
+        manual.push(manualEdit(f));
         continue;
       }
-      patched++;
+      // Do not duplicate an insertion for repeated findings, or compose
+      // unrelated insertions at the same offset without knowing their order.
+      if (edit.edits.some((e) => positional.some((p) => p.pos === e.pos))) {
+        unpatched++;
+        manual.push(manualEdit(f));
+        continue;
+      }
       positional.push(...edit.edits);
       edits.push({ findingId: f.id, file: rel, line: f.line, description: edit.description, safe: edit.safe });
     }
@@ -116,6 +112,12 @@ export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
       patchedContent = patchedContent.slice(0, e.pos) + e.text + patchedContent.slice(e.pos);
     }
 
+    if (!parse(rel, patchedContent)) {
+      unpatched += edits.length;
+      manual.push(...edits.map((e) => ({ ...e, safe: false, description: "Generated patch failed syntax validation; fix this site by hand." })));
+      continue;
+    }
+    patched += edits.length;
     files.push({ file: rel, before: content, after: patchedContent, edits });
   }
 
@@ -127,19 +129,66 @@ export function renderDiff(plan: CodemodPlan): string {
   return plan.files.map((f) => unifiedDiff(f.file, f.before, f.after)).filter(Boolean).join("");
 }
 
-/** Write the planned changes to disk. Returns the files that were changed. */
+/**
+ * Write only wholly safe file plans. A review-required edit blocks the entire
+ * file, including otherwise safe edits in that file. Counts in the plan are
+ * suggestions; the returned paths are the authoritative list of applied files.
+ */
 export function applyPlan(root: string, plan: CodemodPlan): string[] {
   const written: string[] = [];
   for (const f of plan.files) {
-    const full = pathJoin(root, f.file);
+    if (!f.edits.length || f.edits.some((e) => !e.safe) || !parse(f.file, f.after)) continue;
+    let fd: number | undefined;
     try {
-      writeFileSync(full, f.after, "utf8");
+      // Recheck containment, symlink ancestors and bounded contents at apply time.
+      if (readRepoFileSync(root, f.file) !== f.before || constants.O_NOFOLLOW === undefined) continue;
+      const full = path.join(realpathSync(root), f.file);
+      // Never use O_TRUNC: first inspect and read the actual write descriptor.
+      fd = openSync(full, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const before = fstatSync(fd);
+      if (!before.isFile() || before.nlink !== 1 || before.size > MAX_FILE_BYTES) continue;
+      const expected = Buffer.from(f.before, "utf8");
+      if (before.size !== expected.length) continue;
+      const actual = Buffer.alloc(expected.length + 1);
+      let total = 0;
+      while (total < actual.length) {
+        const n = readSync(fd, actual, total, actual.length - total, total);
+        if (n === 0) break;
+        total += n;
+      }
+      if (total !== expected.length || !actual.subarray(0, total).equals(expected)) continue;
+      if (readRepoFileSync(root, f.file) !== f.before) continue;
+      const current = lstatSync(full);
+      const checked = fstatSync(fd);
+      if (!current.isFile() || current.dev !== checked.dev || current.ino !== checked.ino
+        || before.size !== checked.size || before.mtimeMs !== checked.mtimeMs || before.ctimeMs !== checked.ctimeMs) continue;
+      const output = Buffer.from(f.after, "utf8");
+      let offset = 0;
+      while (offset < output.length) {
+        const n = writeSync(fd, output, offset, output.length - offset, offset);
+        if (n === 0) throw new Error("Short codemod write");
+        offset += n;
+      }
+      ftruncateSync(fd, output.length);
       written.push(f.file);
     } catch {
-      // leave the file untouched if it cannot be written
+      // Unsafe, stale or inaccessible files are skipped. I/O errors after the
+      // write starts can still leave a partial write; this is not a transaction.
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
   }
   return written;
+}
+
+const MAX_FILE_BYTES = 1_000_000;
+
+function manualEdit(f: Finding): CodemodEdit {
+  return {
+    findingId: f.id, file: f.file, line: f.line,
+    description: "No safe automatic patch could be generated for this site; apply the suggested fix by hand.",
+    safe: false,
+  };
 }
 
 const PATCHABLE = new Set([
@@ -159,8 +208,9 @@ function planEdit(sf: ts.SourceFile, f: Finding): Edit | null {
   switch (f.id) {
     case "unbounded-read":
       return planUnboundedRead(sf, f);
+    // SQL dialect, statement boundaries and result semantics are unknown.
     case "unbounded-raw-query":
-      return planRawQuery(sf, f);
+      return null;
     case "outbound-no-timeout":
       return planOutboundTimeout(sf, f);
     case "floating-promise":
@@ -178,65 +228,50 @@ function planUnboundedRead(sf: ts.SourceFile, f: Finding): Edit | null {
   if (!/^(findMany|findAll)$/.test(method)) return null;
   const key = method === "findMany" ? "take" : "limit";
 
+  if (call.arguments.some(ts.isSpreadElement) || call.arguments.length > 1) return null;
   if (call.arguments.length === 0) {
     // Insert the options object just before the closing paren.
     return {
       description: `add \`${key}: 50\` to ${method}()`,
-      safe: true,
+      safe: false,
       edits: [{ pos: call.getEnd() - 1, text: `{ ${key}: 50 }` }],
     };
   }
 
   const arg = call.arguments[0];
-  if (ts.isObjectLiteralExpression(arg)) {
+  if (ts.isObjectLiteralExpression(arg) && extensibleConfig(arg, ["take", "limit", "skip", "offset", "cursor"])) {
     // Insert the key right after the opening brace.
     return {
       description: `add \`${key}: 50\` to ${method}()`,
-      safe: true,
+      safe: false,
       edits: [{ pos: arg.getStart(sf) + 1, text: ` ${key}: 50,` }],
     };
   }
   return null;
 }
 
-/** Append a LIMIT to a raw SQL string or template. */
-function planRawQuery(sf: ts.SourceFile, f: Finding): Edit | null {
-  const call = findCallAtLine(sf, f.line, isRawQueryCall);
-  if (!call) return null;
-  const arg = call.arguments[0];
-  if (!arg) return null;
-
-  if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) {
-    // Insert before the closing quote.
-    return {
-      description: "add `LIMIT 50` to the raw query",
-      safe: true,
-      edits: [{ pos: arg.getEnd() - 1, text: " LIMIT 50" }],
-    };
-  }
-  if (ts.isTemplateExpression(arg)) {
-    return {
-      description: "add `LIMIT 50` to the raw query",
-      safe: true,
-      edits: [{ pos: arg.getEnd() - 1, text: " LIMIT 50" }],
-    };
-  }
-  return null;
-}
 
 /** Add a timeout to an outbound call. */
 function planOutboundTimeout(sf: ts.SourceFile, f: Finding): Edit | null {
   const call = findCallAtLine(sf, f.line, isOutboundCall);
-  if (!call) return null;
+  if (!call || call.arguments.some(ts.isSpreadElement) || call.questionDotToken) return null;
 
   const expr = call.expression;
-  const isFetch = ts.isIdentifier(expr) && expr.text === "fetch";
-  const isAxios = ts.isPropertyAccessExpression(expr) && expr.expression.getText() === "axios";
+  const isFetch = isHttpFetch(expr);
+  const isAxios = ts.isPropertyAccessExpression(expr) && isAxiosBinding(expr.expression);
   if (!isFetch && !isAxios) return null;
 
   if (isFetch) {
-    if (call.arguments.length === 0) return null;
-    if (call.arguments.length >= 2 && ts.isObjectLiteralExpression(call.arguments[1])) {
+    // Generated code must not accidentally call a user-defined AbortSignal.
+    if (checkerFor(sf).getSymbolsInScope(call, ts.SymbolFlags.Value).some(symbol => symbol.name === "AbortSignal")) return null;
+    if (call.arguments.length === 0 || call.arguments.length > 2) return null;
+    // A Request input can carry its own cancellation signal. Only inputs
+    // known to produce strings can safely receive a new signal without
+    // inspecting (or evaluating again) the first argument.
+    const input = call.arguments[0];
+    if (!ts.isStringLiteral(input) && !ts.isNoSubstitutionTemplateLiteral(input) && !ts.isTemplateExpression(input)) return null;
+    if (call.arguments.length === 2) {
+      if (!ts.isObjectLiteralExpression(call.arguments[1]) || !extensibleConfig(call.arguments[1], ["signal", "timeout"])) return null;
       // fetch(url, { ... }) -> fetch(url, { signal: ..., ... })
       const config = call.arguments[1];
       return {
@@ -257,10 +292,13 @@ function planOutboundTimeout(sf: ts.SourceFile, f: Finding): Edit | null {
   // axios: get(url, config) vs post(url, data, config)
   const method = (expr as ts.PropertyAccessExpression).name.getText();
   const hasBody = method === "post" || method === "put" || method === "patch";
-  const configIndex = hasBody ? 2 : 1;
+  if (!/^(get|post|put|delete|patch|head|options|request)$/.test(method)) return null;
+  const configIndex = method === "request" ? 0 : hasBody ? 2 : 1;
+  if (call.arguments.length === 0 || call.arguments.length > configIndex + 1) return null;
   const config = call.arguments[configIndex];
 
   if (config && ts.isObjectLiteralExpression(config)) {
+    if (!extensibleConfig(config, ["signal", "timeout", "cancelToken"])) return null;
     return {
       description: "add a 5s timeout to the axios call",
       safe: true,
@@ -280,10 +318,17 @@ function planOutboundTimeout(sf: ts.SourceFile, f: Finding): Edit | null {
 /** `db.user.create(x)` -> `await db.user.create(x)`. */
 function planFloatingPromise(sf: ts.SourceFile, f: Finding): Edit | null {
   const call = findCallAtLine(sf, f.line, isWriteCall);
-  if (!call) return null;
+  if (!call || !ts.isExpressionStatement(call.parent) || call.parent.expression !== call) return null;
+  // Await belongs to the nearest function, not an outer async callback.
+  let owner: ts.Node | undefined = call.parent;
+  while (owner && !ts.isFunctionLike(owner)) {
+    if (ts.isClassStaticBlockDeclaration(owner)) return null;
+    owner = owner.parent;
+  }
+  if (!owner || !ts.canHaveModifiers(owner) || !ts.getModifiers(owner)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return null;
   return {
-    description: "await the floating promise",
-    safe: true,
+    description: "await the floating promise (review ordering and error propagation)",
+    safe: false,
     edits: [{ pos: call.getStart(sf), text: "await " }],
   };
 }
@@ -292,20 +337,19 @@ function planFloatingPromise(sf: ts.SourceFile, f: Finding): Edit | null {
 // AST helpers
 
 function findCallAtLine(sf: ts.SourceFile, line: number, predicate: (call: ts.CallExpression) => boolean): ts.CallExpression | null {
-  let found: ts.CallExpression | null = null;
+  const candidates: ts.CallExpression[] = [];
   const visit = (node: ts.Node) => {
-    if (found) return;
     if (ts.isCallExpression(node)) {
       const ln = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
-      if (ln === line && predicate(node)) {
-        found = node;
-        return;
-      }
+      if (ln === line) candidates.push(node);
     }
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  return found;
+  // Include unsupported calls: the line-only finding could refer to one of
+  // those rather than the call we know how to patch. Helper calls on the same
+  // line are conservatively manual too, until findings carry exact offsets.
+  return candidates.length === 1 && predicate(candidates[0]) ? candidates[0] : null;
 }
 
 function isCollectionRead(call: ts.CallExpression): boolean {
@@ -314,18 +358,15 @@ function isCollectionRead(call: ts.CallExpression): boolean {
   return name === "findMany" || name === "findAll";
 }
 
-function isRawQueryCall(call: ts.CallExpression): boolean {
-  const name = ts.isPropertyAccessExpression(call.expression) ? call.expression.name.getText() : "";
-  return /^\$(query|execute)Raw/.test(name) || name === "raw";
-}
 
 function isOutboundCall(call: ts.CallExpression): boolean {
   const expr = call.expression;
-  if (ts.isIdentifier(expr)) return expr.text === "fetch";
+  if (isHttpFetch(expr)) return true;
+  if (ts.isIdentifier(expr)) return false;
   if (ts.isPropertyAccessExpression(expr)) {
     const recv = expr.expression.getText();
     const method = expr.name.getText();
-    return recv === "axios" && /^(get|post|put|delete|patch|head|options|request)$/.test(method);
+    return isAxiosBinding(expr.expression) && /^(get|post|put|delete|patch|head|options|request)$/.test(method);
   }
   return false;
 }
@@ -350,14 +391,28 @@ function parse(rel: string, content: string): ts.SourceFile | null {
         : rel.endsWith(".js") || rel.endsWith(".mjs") || rel.endsWith(".cjs")
           ? ts.ScriptKind.JS
           : ts.ScriptKind.TS;
-    return ts.createSourceFile(rel, content, ts.ScriptTarget.Latest, true, kind);
+    const sf = ts.createSourceFile(rel, content, ts.ScriptTarget.Latest, true, kind);
+    // TypeScript's parser recovers from syntax errors rather than throwing.
+    const diagnostics = (sf as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] }).parseDiagnostics;
+    if (diagnostics.length) return null;
+    const result = ts.transpileModule(content, {
+      fileName: rel,
+      reportDiagnostics: true,
+      compilerOptions: { target: ts.ScriptTarget.Latest, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.Preserve },
+    });
+    return result.diagnostics?.some((d) => d.category === ts.DiagnosticCategory.Error) ? null : sf;
   } catch {
     return null;
   }
 }
 
-function pathJoin(root: string, rel: string): string {
-  return `${root.replace(/\/+$/, "")}/${rel}`;
+/** Unknown keys (including spreads/computed names) may hide an existing option. */
+function extensibleConfig(config: ts.ObjectLiteralExpression, reserved: string[]): boolean {
+  return config.properties.every((p) => {
+    if (ts.isSpreadAssignment(p) || !p.name || ts.isComputedPropertyName(p.name)) return false;
+    const name = ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name) ? p.name.text : null;
+    return name !== null && !reserved.includes(name);
+  });
 }
 
 /**
@@ -368,7 +423,9 @@ export function unifiedDiff(file: string, before: string, after: string): string
   if (before === after) return "";
   const beforeLines = splitLines(before);
   const afterLines = splitLines(after);
-  const ops = diffLines(beforeLines, afterLines);
+  // A newline-only change must replace the final line, not become context.
+  const newlineChanged = before.endsWith("\n") !== after.endsWith("\n");
+  const ops = diffLines(beforeLines, afterLines, newlineChanged);
   const CONTEXT = 3;
 
   // A file that does not end with a newline needs the marker in the diff.
@@ -416,7 +473,8 @@ export function unifiedDiff(file: string, before: string, after: string): string
     if (lastNew < 0 && ops[k].kind !== "-") lastNew = k;
   }
 
-  const out: string[] = [`--- a/${file}`, `+++ b/${file}`];
+  const quotePath = (prefix: string) => /[\s"\\]/.test(file) ? JSON.stringify(`${prefix}/${file}`) : `${prefix}/${file}`;
+  const out: string[] = [`--- ${quotePath("a")}`, `+++ ${quotePath("b")}`];
   for (const [start, end] of hunks) {
     let oldCount = 0;
     let newCount = 0;
@@ -424,14 +482,13 @@ export function unifiedDiff(file: string, before: string, after: string): string
       if (ops[k].kind !== "+") oldCount++;
       if (ops[k].kind !== "-") newCount++;
     }
-    out.push(`@@ -${oldLineOf[start]},${oldCount} +${newLineOf[start]},${newCount} @@`);
+    out.push(`@@ -${oldLineOf[start] - (oldCount === 0 ? 1 : 0)},${oldCount} +${newLineOf[start] - (newCount === 0 ? 1 : 0)},${newCount} @@`);
     for (let k = start; k <= end; k++) {
       const op = ops[k];
       if (op.kind === " ") out.push(` ${op.text}`);
       else if (op.kind === "-") out.push(`-${op.text}`);
       else out.push(`+${op.text}`);
-      if (k === lastOld && beforeNoNewline) out.push("\\ No newline at end of file");
-      if (k === lastNew && afterNoNewline) out.push("\\ No newline at end of file");
+      if ((k === lastOld && beforeNoNewline) || (k === lastNew && afterNoNewline)) out.push("\\ No newline at end of file");
     }
   }
   return out.join("\n") + "\n";
@@ -453,10 +510,27 @@ function splitLines(content: string): string[] {
 
 type DiffOp = { kind: " " | "-" | "+"; text: string };
 
-function diffLines(a: string[], b: string[]): DiffOp[] {
+function diffLines(a: string[], b: string[], newlineChanged = false): DiffOp[] {
+  // Trim shared edges first. Bound both LCS time and memory; for a large
+  // changed region use a coarser (but valid) delete/insert hunk instead.
+  let prefix = 0;
+  const shared = Math.min(a.length, b.length);
+  while (prefix < shared && a[prefix] === b[prefix]
+    && !(newlineChanged && (prefix === a.length - 1 || prefix === b.length - 1))) prefix++;
+  let suffix = 0;
+  if (!newlineChanged) {
+    while (suffix < shared - prefix && a[a.length - suffix - 1] === b[b.length - suffix - 1]) suffix++;
+  }
+  const leading: DiffOp[] = a.slice(0, prefix).map((text) => ({ kind: " ", text }));
+  const trailing: DiffOp[] = suffix ? a.slice(a.length - suffix).map((text) => ({ kind: " ", text })) : [];
+  a = a.slice(prefix, a.length - suffix);
+  b = b.slice(prefix, b.length - suffix);
   const n = a.length;
   const m = b.length;
-  // LCS table. Files here are small enough for O(n*m).
+  if ((n + 1) * (m + 1) > 250_000 || newlineChanged) {
+    return [...leading, ...a.map((text): DiffOp => ({ kind: "-", text })),
+      ...b.map((text): DiffOp => ({ kind: "+", text })), ...trailing];
+  }
   const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
@@ -481,5 +555,5 @@ function diffLines(a: string[], b: string[]): DiffOp[] {
   }
   while (i < n) ops.push({ kind: "-", text: a[i++] });
   while (j < m) ops.push({ kind: "+", text: b[j++] });
-  return ops;
+  return [...leading, ...ops, ...trailing];
 }

@@ -1,5 +1,4 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
+import { isRecord, parseRepoManifest, readRepoFile } from "../repoFiles.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
@@ -10,9 +9,11 @@ export async function detectInProcessState(root: string, ws?: Workspace): Promis
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
 
-  let pkg: any = {};
-  try { pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")); } catch {}
-  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+  const pkg = parseRepoManifest(await readRepoFile(root, "package.json"));
+  const deps = {
+    ...(isRecord(pkg.dependencies) ? pkg.dependencies : {}),
+    ...(isRecord(pkg.devDependencies) ? pkg.devDependencies : {}),
+  };
 
   for (const unit of workspace.units) {
     const { rel, content, sf, ctx } = unit;
@@ -43,7 +44,7 @@ function storeVerdict(arg: ts.Expression | undefined): StoreVerdict {
     const name = (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) ? p.name.getText().replace(/['"]/g, "") : "";
     return name === "store";
   });
-  return hasStore ? "present" : "none";
+  return hasStore ? "present" : val.properties.some(p => ts.isSpreadAssignment(p) || (p.name && ts.isComputedPropertyName(p.name))) ? "unknown" : "none";
 }
 
 function visitSession(sf: ts.SourceFile, content: string, rel: string, ctx: FileContext, out: Finding[]) {
@@ -149,7 +150,7 @@ function visitRateLimit(sf: ts.SourceFile, content: string, rel: string, ctx: Fi
   visit(sf);
 }
 
-function visitSocketIo(sf: ts.SourceFile, content: string, rel: string, deps: Record<string, string>, out: Finding[]) {
+function visitSocketIo(sf: ts.SourceFile, content: string, rel: string, deps: Record<string, unknown>, out: Finding[]) {
   if (deps["@socket.io/redis-adapter"] || deps["socket.io-redis"]) return;
   if (!hasSocketIoImport(sf)) return;
   let line: number | null = null;

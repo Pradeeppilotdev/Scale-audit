@@ -12,7 +12,7 @@ inputs:
   version:
     description: Version of @pradeeppilot/scale-audit to run.
     required: false
-    default: "0.3.4"
+    default: "0.3.5"
   github-token:
     description: Token used to post the PR comment.
     required: false
@@ -20,27 +20,34 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Set up supported Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: "^24.22.1"
+        check-latest: true
     - name: Run scale-audit
       shell: bash
       env:
         INPUT_REPO: ${{ inputs.repo }}
         FAIL_ON: ${{ inputs.fail-on }}
         AUDIT_VERSION: ${{ inputs.version }}
+        REPORT_FILE: ${{ runner.temp }}/scale-audit-${{ github.run_id }}-${{ github.run_attempt }}.md
       run: |
         REPO="$INPUT_REPO"
         if [ -z "$REPO" ]; then
           REPO="$GITHUB_WORKSPACE"
         fi
-        ARGS=("$REPO" --format md --out scale-audit-report.md)
+        rm -f -- "$REPORT_FILE"
+        ARGS=("$REPO" --format md --out "$REPORT_FILE")
         if [ -n "$FAIL_ON" ]; then
           ARGS+=(--fail-on "$FAIL_ON")
         fi
         npx --yes "@pradeeppilot/scale-audit@$AUDIT_VERSION" "${ARGS[@]}"
     - name: Comment on PR
       if: always() && github.event_name == 'pull_request'
-      uses: actions/github-script@v7
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
-        REPORT_FILE: scale-audit-report.md
+        REPORT_FILE: ${{ runner.temp }}/scale-audit-${{ github.run_id }}-${{ github.run_attempt }}.md
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -51,7 +58,7 @@ runs:
           const { owner, repo } = context.repo;
           const issue_number = context.issue.number;
           const comments = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
-          const existing = comments.data.find((c) => c.body && c.body.includes(marker));
+          const existing = comments.data.find((c) => c.user?.login === "github-actions[bot]" && c.body?.includes(marker));
           if (existing) {
             await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
           } else {

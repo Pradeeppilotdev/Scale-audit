@@ -20,6 +20,12 @@ export function renderMarkdown(report: Report): string {
   lines.push(`## Verdict`);
   lines.push("");
   lines.push(`**Scale score: ${report.score}/100**`);
+  if (report.coverage) {
+    const c = report.coverage;
+    lines.push("", `Source coverage: ${c.analyzed}/${c.discovered} analyzed; ${c.skipped.length} skipped.`);
+    if (c.skipped.length || c.analyzed === 0) lines.push("", "> Incomplete source coverage. This score applies only to analyzed files.");
+    for (const skip of c.skipped) lines.push(`- Skipped ${JSON.stringify(skip.file)}: ${skip.reason}`);
+  }
   if (report.fingerprint.projectType === "library") {
     lines.push("");
     lines.push(
@@ -81,9 +87,12 @@ export function renderMarkdown(report: Report): string {
     const cm = report.codemod;
     lines.push(`## Automated fixes`);
     lines.push("");
-    lines.push(`- ${cm.patched} fix(es) generated, ${cm.unpatched} finding(s) need a manual fix.`);
+    lines.push(`- ${cm.patched} suggestion(s) generated; ${cm.appliedEdits ?? 0} edit(s) applied; ${cm.unpatched} site(s) have no generated patch.`);
     for (const e of cm.edits.slice(0, MAX_PER_CATEGORY)) {
-      lines.push(`- \`${e.file}:${e.line}\` — ${e.description}`);
+      lines.push(`- \`${e.file}:${e.line}\` — ${e.description}${e.safe ? "" : " (review required; never auto-applied)"}`);
+    }
+    for (const e of (cm.manual ?? []).slice(0, MAX_PER_CATEGORY)) {
+      lines.push(`- Manual: \`${e.file}:${e.line}\` — ${e.description}`);
     }
     if (cm.diff) {
       lines.push("");

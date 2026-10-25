@@ -38,18 +38,7 @@ function visit(
       if (model) {
         const where = findWhereObject(node);
         if (where) {
-          for (const p of where.properties) {
-            if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) continue;
-            const field = p.name.getText().replace(/['"]/g, "");
-            if (!field) continue;
-            // Logical operators and nested relation filters are not columns.
-            if (field === "OR" || field === "AND" || field === "NOT") continue;
-            if (ts.isPropertyAssignment(p)) {
-              const val = unwrap(p.initializer);
-              if (ts.isObjectLiteralExpression(val) || ts.isArrayLiteralExpression(val)) continue;
-              // `field: null` / `field: undefined` style negation is rarely scale-relevant.
-              if (val.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(val) && val.text === "undefined")) continue;
-            }
+          for (const field of filterFields(where, model)) {
             if (!model.indexed.has(field)) {
               const ln = lineOf(sf, node);
               out.push(
@@ -103,4 +92,30 @@ function findWhereObject(node: ts.CallExpression): ts.ObjectLiteralExpression | 
     }
   }
   return null;
+}
+
+/** Walk logical groups, but not relation subtrees or arbitrary JSON objects. */
+function filterFields(where: ts.ObjectLiteralExpression, model: PrismaModel, depth = 0): Set<string> {
+  const fields = new Set<string>();
+  if (depth > 64) return fields;
+  for (const property of where.properties) {
+    if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) continue;
+    const field = property.name.getText().replace(/['"]/g, "");
+    const value = ts.isPropertyAssignment(property) ? unwrap(property.initializer) : property.name;
+    if (["AND", "OR", "NOT"].includes(field)) {
+      for (const group of ts.isArrayLiteralExpression(value) ? value.elements : [value]) {
+        if (ts.isObjectLiteralExpression(group)) for (const nested of filterFields(group, model, depth + 1)) fields.add(nested);
+      }
+      continue;
+    }
+    if (value.kind === ts.SyntaxKind.NullKeyword || (ts.isIdentifier(value) && value.text === "undefined")) continue;
+    if (ts.isArrayLiteralExpression(value)) continue;
+    if (ts.isObjectLiteralExpression(value)) {
+      if (!model.scalarFields?.has(field)) continue;
+      const keys = value.properties.map(p => p.name?.getText().replace(/['"]/g, ""));
+      if (!keys.some(key => key && ["equals", "in", "notIn", "lt", "lte", "gt", "gte", "not", "startsWith", "endsWith", "contains"].includes(key))) continue;
+    }
+    fields.add(field);
+  }
+  return fields;
 }

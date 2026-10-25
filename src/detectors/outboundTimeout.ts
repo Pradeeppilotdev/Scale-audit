@@ -1,38 +1,62 @@
+import { checkerFor, definitionOf, isAxiosBinding, isHttpFetch } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
 
 const AXIOS_METHODS = new Set(["get", "post", "put", "delete", "patch", "head", "options", "request"]);
-// `axios.create({ timeout: ... })` at module scope configures a shared client.
-const SHARED_AXIOS_TIMEOUT = /axios\.create\s*\(\s*\{[\s\S]{0,400}?timeout\s*:/;
-// Only an explicit timer counts as a timeout; a bare AbortController signal is cancellation-only.
-const REAL_TIMEOUT_EXPR = /AbortSignal\.timeout\s*\(/;
-
 export async function detectOutboundTimeouts(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
+  const clients = new Map<ts.Declaration, Client>();
+  for (const { sf } of workspace.units) {
+    const collect = (node: ts.Node) => {
+      const init = ts.isVariableDeclaration(node) ? node.initializer : ts.isExportAssignment(node) ? node.expression : undefined;
+      if (init && ts.isCallExpression(init) && ts.isPropertyAccessExpression(init.expression)
+        && init.expression.name.text === "create" && isAxiosBinding(init.expression.expression)
+        && (ts.isVariableDeclaration(node) || ts.isExportAssignment(node))) {
+        clients.set(node, { config: asObject(init.arguments[0]) ?? undefined, mutated: false });
+      }
+      ts.forEachChild(node, collect);
+    };
+    collect(sf);
+  }
+  for (const { sf } of workspace.units) {
+    const mutations = (node: ts.Node) => {
+      // Defaults are mutable even for const clients. Any reference to defaults
+      // invalidates inherited assumptions; explicit call options still apply.
+      if (ts.isPropertyAccessExpression(node) && node.name.text === "defaults") {
+        const declaration = definitionOf(node.expression);
+        const client = declaration && clients.get(declaration);
+        if (client) client.mutated = true;
+      }
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+        && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment && ts.isIdentifier(node.left)) {
+        const declaration = definitionOf(node.left);
+        const client = declaration && clients.get(declaration);
+        if (client) client.mutated = true;
+      }
+      ts.forEachChild(node, mutations);
+    };
+    mutations(sf);
+  }
   for (const { rel, content, sf } of workspace.units) {
-    visit(sf, sf, content, rel, SHARED_AXIOS_TIMEOUT.test(content), out);
+    visit(sf, sf, content, rel, clients, checkerFor(sf), out);
   }
   return out;
 }
 
-function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, sharedAxiosTimeout: boolean, out: Finding[]) {
+function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, clients: Map<ts.Declaration, Client>, checker: ts.TypeChecker, out: Finding[]) {
   if (ts.isCallExpression(node)) {
-    const target = calleeInfo(node.expression);
+    const target = calleeInfo(node.expression, clients, checker);
     if (target) {
-      const sharedClientCovers = target.kind === "axios" && sharedAxiosTimeout;
-      if (!sharedClientCovers) {
-        const check = timeoutCheck(node, target);
-        if (check !== "bounded") {
-          const ln = lineOf(sf, node);
-          out.push(buildFinding(check, target.name, content, rel, ln));
-        }
+      const check = timeoutCheck(node, target);
+      if (check !== "bounded") {
+        out.push(buildFinding(check, target.name, content, rel, lineOf(sf, node)));
       }
     }
   }
-  ts.forEachChild(node, (c) => visit(c, sf, content, rel, sharedAxiosTimeout, out));
+  ts.forEachChild(node, (c) => visit(c, sf, content, rel, clients, checker, out));
 }
 
 function buildFinding(check: Exclude<TimeoutCheck, "bounded">, callName: string, content: string, rel: string, ln: number): Finding {
@@ -60,7 +84,7 @@ function buildFinding(check: Exclude<TimeoutCheck, "bounded">, callName: string,
       ...base,
       severity: "low",
       confidence: "low",
-      message: `Outbound HTTP call (${callName}) uses a config object passed as a variable; could not confirm a timeout/abort signal.`,
+      message: `Outbound HTTP call (${callName}) uses configuration that could not be resolved; could not confirm a timeout/abort signal.`,
       scaleTrigger: "A slow downstream stalls requests and can exhaust sockets/connections under load.",
       suggestedFix: "Set a timeout/AbortSignal (e.g. fetch(url, { signal: AbortSignal.timeout(5000) }) or axios timeout) and consider retries with backoff.",
     });
@@ -76,21 +100,34 @@ function buildFinding(check: Exclude<TimeoutCheck, "bounded">, callName: string,
   });
 }
 
-function calleeInfo(expr: ts.Expression): { name: string; kind: "fetch" | "axios" | "http" } | null {
-  if (ts.isIdentifier(expr) && expr.text === "fetch") return { name: "fetch", kind: "fetch" };
+interface Client { config?: ts.ObjectLiteralExpression; mutated: boolean }
+interface Target { name: string; kind: "fetch" | "axios" | "http"; defaults?: ts.ObjectLiteralExpression; unknownDefaults?: boolean }
+
+function calleeInfo(expr: ts.Expression, clients: Map<ts.Declaration, Client>, checker: ts.TypeChecker): Target | null {
+  if (isHttpFetch(expr)) return { name: "fetch", kind: "fetch" };
   if (ts.isPropertyAccessExpression(expr)) {
     const receiver = expr.expression.getText();
     const method = expr.name.getText();
-    if (receiver === "axios" && AXIOS_METHODS.has(method)) return { name: `axios.${method}`, kind: "axios" };
+    const symbol = ts.isIdentifier(expr.expression) ? checker.getSymbolAtLocation(expr.expression) : undefined;
+    const declaration = definitionOf(expr.expression);
+    const client = declaration && clients.get(declaration);
+    const isParameter = symbol?.declarations?.some(ts.isParameter);
+    if ((client || (isAxiosBinding(expr.expression) && !isParameter)) && AXIOS_METHODS.has(method)) {
+      return { name: `axios.${method}`, kind: "axios", defaults: client?.mutated ? undefined : client?.config,
+        unknownDefaults: client ? client.mutated || !client.config : false };
+    }
     if ((receiver === "http" || receiver === "https") && method === "request") return { name: `${receiver}.request`, kind: "http" };
   }
-  if (ts.isIdentifier(expr) && expr.text === "axios") return { name: "axios", kind: "axios" };
+  const declaration = definitionOf(expr);
+  const client = declaration && clients.get(declaration);
+  if (client) return { name: "axios", kind: "axios", defaults: client.mutated ? undefined : client.config, unknownDefaults: client.mutated || !client.config };
+  if (isAxiosBinding(expr)) return { name: "axios", kind: "axios" };
   return null;
 }
 
 type TimeoutCheck = "bounded" | "unbounded" | "unknown" | "cancellation-only";
 
-function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fetch" | "axios" | "http" }): TimeoutCheck {
+function timeoutCheck(node: ts.CallExpression, target: Target): TimeoutCheck {
   const args = node.arguments;
   let config: ts.Expression | undefined;
 
@@ -99,16 +136,19 @@ function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fe
     config = args[1];
   } else if (target.kind === "axios") {
     // axios(config) vs axios.get(url, config?)
-    config = target.name === "axios" ? args[0] : args[1];
+    const method = target.name.split(".")[1];
+    config = target.name === "axios" || method === "request"
+      ? (args.length > 1 ? args[1] : args[0])
+      : args[["post", "put", "patch"].includes(method) ? 2 : 1];
   } else {
     // http.request(options) vs http.request(url, options?)
-    config = args.length >= 2 ? args[1] : args[0];
+    config = args[1] && !ts.isArrowFunction(args[1]) && !ts.isFunctionExpression(args[1]) ? args[1] : args[0];
   }
 
-  if (!config) return "unbounded";
+  if (!config) return target.unknownDefaults ? "unknown" : target.defaults ? objectTimeoutVerdict(target.defaults, target.kind) : "unbounded";
 
   const obj = asObject(config);
-  if (obj) return objectTimeoutVerdict(obj);
+  if (obj) return objectTimeoutVerdict(obj, target.kind, target.defaults, target.unknownDefaults);
 
   // String-literal argument in the config position is a URL (http.request("...")).
   if (ts.isStringLiteral(config) || ts.isNoSubstitutionTemplateLiteral(config) || ts.isTemplateExpression(config)) {
@@ -119,22 +159,46 @@ function timeoutCheck(node: ts.CallExpression, target: { name: string; kind: "fe
   return "unknown";
 }
 
-function objectTimeoutVerdict(config: ts.ObjectLiteralExpression): Exclude<TimeoutCheck, "unknown"> {
-  let hasRealTimeout = false;
-  let hasSignal = false;
-  for (const p of config.properties) {
-    if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) continue;
-    const name = p.name.getText().replace(/['"]/g, "");
-    if (name === "timeout" || name === "timeoutMs") hasRealTimeout = true;
-    if (name === "signal") {
-      hasSignal = true;
-      const valueText = ts.isPropertyAssignment(p) ? p.initializer.getText() : p.name.getText();
-      if (REAL_TIMEOUT_EXPR.test(valueText)) hasRealTimeout = true;
+/** Only supported options and proven timer signals count as bounded. */
+function objectTimeoutVerdict(config: ts.ObjectLiteralExpression, kind: Target["kind"], defaults?: ts.ObjectLiteralExpression, unknownDefaults = false): TimeoutCheck {
+  let timeout: ts.Expression | undefined;
+  let signal: ts.Expression | undefined;
+  let unknown = unknownDefaults;
+  for (const obj of defaults ? [defaults, config] : [config]) {
+    for (const p of obj.properties) {
+      if (ts.isSpreadAssignment(p) || !p.name || ts.isComputedPropertyName(p.name)) {
+        timeout = signal = undefined;
+        unknown = true;
+        continue;
+      }
+      const name = ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) ? p.name.text : "";
+      const value = ts.isPropertyAssignment(p) ? p.initializer : ts.isShorthandPropertyAssignment(p) ? p.name : undefined;
+      if (name === "timeout") timeout = value;
+      if (name === "signal") signal = value;
     }
   }
-  if (hasRealTimeout) return "bounded";
-  if (hasSignal) return "cancellation-only";
+  if (signal && timerSignal(signal)) return "bounded";
+  // Node http timeout emits an event; it does not itself abort the request.
+  if (kind === "axios" && timeout) {
+    if (ts.isNumericLiteral(timeout)) {
+      if (Number.isFinite(Number(timeout.text)) && Number(timeout.text) > 0) return "bounded";
+    } else if (!ts.isPrefixUnaryExpression(timeout) && timeout.kind !== ts.SyntaxKind.NullKeyword) unknown = true;
+  }
+  if (unknown) return "unknown";
+  if (signal) return "cancellation-only";
   return "unbounded";
+}
+
+function timerSignal(expr: ts.Expression): boolean {
+  if (!ts.isCallExpression(expr)) return false;
+  if (expr.expression.getText() === "AbortSignal.timeout") {
+    const value = expr.arguments[0];
+    return !!value && ts.isNumericLiteral(value) && Number.isSafeInteger(Number(value.text)) && Number(value.text) >= 0;
+  }
+  if (expr.expression.getText() === "AbortSignal.any" && expr.arguments[0] && ts.isArrayLiteralExpression(expr.arguments[0])) {
+    return expr.arguments[0].elements.some((element) => ts.isExpression(element) && timerSignal(element));
+  }
+  return false;
 }
 
 function asObject(arg: ts.Expression | undefined): ts.ObjectLiteralExpression | null {

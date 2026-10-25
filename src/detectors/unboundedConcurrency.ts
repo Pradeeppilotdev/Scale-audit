@@ -1,3 +1,4 @@
+import { importedBinding, symbolOf } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
@@ -88,8 +89,20 @@ function calleeName(node: ts.CallExpression): string {
 
 /** Heuristic: already wrapped in a limiter/chunk helper. */
 function isLimited(call: ts.CallExpression): boolean {
-  const text = call.getText();
-  return /limit|concurren|chunk|batch|semaphore|pLimit|p-queue|pMap/i.test(text);
+  const callback = call.arguments[0];
+  if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) return false;
+  let returned: ts.Expression | undefined;
+  if (ts.isBlock(callback.body)) {
+    if (callback.body.statements.length !== 1 || !ts.isReturnStatement(callback.body.statements[0])) return false;
+    returned = callback.body.statements[0].expression;
+  } else returned = callback.body;
+  if (returned && ts.isAwaitExpression(returned)) returned = returned.expression;
+  if (!returned || !ts.isCallExpression(returned) || !ts.isIdentifier(returned.expression)) return false;
+  const declaration = symbolOf(returned.expression)?.valueDeclaration;
+  if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer || !ts.isCallExpression(declaration.initializer)) return false;
+  const factory = declaration.initializer;
+  return importedBinding(factory.expression)?.module === "p-limit" && !!factory.arguments[0]
+    && ts.isNumericLiteral(factory.arguments[0]) && Number(factory.arguments[0].text) > 0;
 }
 
 /**
@@ -103,7 +116,10 @@ function isLimited(call: ts.CallExpression): boolean {
  * Scopes are respected: only *enclosing* parameters and declarations count, so
  * an unrelated `callbacks` parameter elsewhere in the file does not count.
  */
-function isUserSized(receiver: ts.Expression, node: ts.Node): boolean {
+function isUserSized(receiver: ts.Expression, node: ts.Node, seen = new Set<ts.Node>()): boolean {
+  if (seen.has(receiver) || seen.size > 128) return false;
+  seen.add(receiver);
+  if (ts.isAwaitExpression(receiver) || ts.isParenthesizedExpression(receiver)) return isUserSized(receiver.expression, node, seen);
   // `await db.findMany()` / `db.findAll()`
   if (ts.isCallExpression(receiver) && ts.isPropertyAccessExpression(receiver.expression)) {
     const method = receiver.expression.name.getText();
@@ -120,65 +136,17 @@ function isUserSized(receiver: ts.Expression, node: ts.Node): boolean {
     }
   }
   // A function parameter: the size is controlled by the caller.
-  if (ts.isIdentifier(receiver) && isParameter(receiver.text, node)) return true;
+  if (ts.isIdentifier(receiver) && symbolOf(receiver)?.declarations?.some(ts.isParameter)) return true;
   // A local bound directly from one of the above.
   if (ts.isIdentifier(receiver)) {
-    const init = findInitializer(receiver.text, node);
+    const declaration = symbolOf(receiver)?.valueDeclaration;
+    const init = declaration && ts.isVariableDeclaration(declaration) ? declaration.initializer : undefined;
     if (init) {
       // `const queue: string[] = []` starts empty and is filled at runtime, so
       // its size is unbounded. A non-empty literal is a fixed-size constant.
       if (ts.isArrayLiteralExpression(init) && init.elements.length === 0) return true;
-      return isUserSized(init, node);
+      return isUserSized(init, node, seen);
     }
   }
   return false;
-}
-
-function isFunctionLike(
-  node: ts.Node,
-): node is ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction | ts.MethodDeclaration | ts.GetAccessorDeclaration | ts.SetAccessorDeclaration {
-  return (
-    ts.isFunctionDeclaration(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node) ||
-    ts.isMethodDeclaration(node) ||
-    ts.isGetAccessorDeclaration(node) ||
-    ts.isSetAccessorDeclaration(node)
-  );
-}
-
-/** True when the identifier is a parameter of an *enclosing* function. */
-function isParameter(name: string, node: ts.Node): boolean {
-  let cur: ts.Node | undefined = node.parent;
-  while (cur) {
-    if (isFunctionLike(cur)) {
-      for (const p of cur.parameters) {
-        if (ts.isIdentifier(p.name) && p.name.text === name) return true;
-      }
-    }
-    cur = cur.parent;
-  }
-  return false;
-}
-
-/**
- * Find the initializer of a local variable with the given name.
- *
- * The nearest preceding declaration wins, so a module-level `const queue = []`
- * is found from inside a function that uses it.
- */
-function findInitializer(name: string, node: ts.Node): ts.Expression | null {
-  const before = node.getStart();
-  let best: { pos: number; init: ts.Expression } | null = null;
-  const visit = (n: ts.Node) => {
-    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name && n.initializer) {
-      const pos = n.getStart();
-      if (pos < before && (!best || pos > best.pos)) best = { pos, init: n.initializer };
-    }
-    ts.forEachChild(n, visit);
-  };
-  let scope: ts.Node = node;
-  while (scope.parent) scope = scope.parent;
-  visit(scope);
-  return best ? (best as { pos: number; init: ts.Expression }).init : null;
 }

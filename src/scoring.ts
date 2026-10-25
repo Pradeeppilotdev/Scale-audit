@@ -57,9 +57,10 @@ export interface CategoryScore {
 export function scoreFindings(findings: Finding[]): { score: number; categories: CategoryScore[] } {
   const byFamily = new Map<string, Finding[]>();
   for (const f of findings) {
-    const arr = byFamily.get(f.id) ?? [];
+    const key = JSON.stringify([f.category, f.id]);
+    const arr = byFamily.get(key) ?? [];
     arr.push(f);
-    byFamily.set(f.id, arr);
+    byFamily.set(key, arr);
   }
 
   const byCategory = new Map<string, { penalty: number; findings: number }>();
@@ -71,22 +72,24 @@ export function scoreFindings(findings: Finding[]): { score: number; categories:
     byCategory.set(category, bucket);
   }
 
+  // Keep the denominator fixed: adding a newly affected category must never
+  // dilute the penalty from existing findings. Unknown categories also add
+  // penalties against this same baseline.
+  for (const category of Object.keys(CATEGORY_WEIGHT)) {
+    if (!byCategory.has(category)) byCategory.set(category, { penalty: 0, findings: 0 });
+  }
   const categories: CategoryScore[] = [];
-  let weighted = 0;
-  let totalWeight = 0;
+  let weightedPenalty = 0;
+  const totalWeight = Object.values(CATEGORY_WEIGHT).reduce((sum, weight) => sum + weight, 0);
   for (const [category, bucket] of byCategory) {
     const weight = CATEGORY_WEIGHT[category] ?? DEFAULT_CATEGORY_WEIGHT;
     const sub = Math.max(0, Math.round(100 - bucket.penalty));
     categories.push({ category, score: sub, findings: bucket.findings, penalty: Math.round(bucket.penalty * 10) / 10, weight });
-    // A category where everything was informational carries no signal.
-    if (bucket.penalty > 0) {
-      weighted += sub * weight;
-      totalWeight += weight;
-    }
+    weightedPenalty += Math.min(100, bucket.penalty) * weight;
   }
 
   categories.sort((a, b) => a.score - b.score);
-  const score = totalWeight === 0 ? 100 : Math.max(0, Math.min(100, Math.round(weighted / totalWeight)));
+  const score = Math.max(0, Math.min(100, Math.floor(100 - weightedPenalty / totalWeight)));
   return { score, categories };
 }
 
@@ -98,13 +101,16 @@ export function scoreFindings(findings: Finding[]): { score: number; categories:
  * serious problem and a class with two hundred trivial ones end up close,
  * without a single class being able to zero the whole repository.
  */
+function effectiveWeight(f: Finding): number {
+  return SEVERITY_WEIGHT[f.severity] * (f.confidence === "low" ? 0.5 : 1);
+}
+
 export function familyPenalty(findings: Finding[]): number {
-  const sorted = [...findings].sort((a, b) => SEVERITY_WEIGHT[b.severity] - SEVERITY_WEIGHT[a.severity]);
+  const sorted = [...findings].sort((a, b) => effectiveWeight(b) - effectiveWeight(a));
   let penalty = 0;
   let factor = 1;
   for (const f of sorted) {
-    const confidence = f.confidence === "low" ? 0.5 : 1;
-    penalty += SEVERITY_WEIGHT[f.severity] * confidence * factor;
+    penalty += effectiveWeight(f) * factor;
     factor *= DECAY;
   }
   return Math.min(penalty, FAMILY_PENALTY_CAP);

@@ -6,7 +6,7 @@ Static, read-only audit for public repos: flags N+1 queries, unbounded reads, mi
 
 [![npm version](https://img.shields.io/npm/v/@pradeeppilot/scale-audit)](https://www.npmjs.com/package/@pradeeppilot/scale-audit)
 [![ci](https://github.com/Pradeeppilotdev/Scale-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Pradeeppilotdev/Scale-audit/actions/workflows/ci.yml)
-[![Node >= 20](https://img.shields.io/node/v/@pradeeppilot/scale-audit)](https://www.npmjs.com/package/@pradeeppilot/scale-audit)
+[![Security-patched Node.js 22/24/26](https://img.shields.io/node/v/@pradeeppilot/scale-audit)](https://www.npmjs.com/package/@pradeeppilot/scale-audit)
 [![license](https://img.shields.io/npm/l/@pradeeppilot/scale-audit)](https://github.com/Pradeeppilotdev/Scale-audit/blob/main/LICENSE)
 
 ```bash
@@ -44,26 +44,40 @@ First bottleneck: **DB** — ORM/database call awaited inside a loop; this is an
 ## Usage
 
 ```bash
-npx @pradeeppilot/scale-audit <repo-url-or-path> [options]
+npx @pradeeppilot/scale-audit <repo-url-or-path-or-file> [options]
 ```
 
 Options:
 - `-o, --out <file>` — write report to a file
 - `--format <json|md>` — output format (default `json`)
 - `--diff` — print a unified diff with automated fixes for the findings
-- `--fix` — apply those automated fixes in place (local paths only)
+- `--fix` — apply only automatically safe fixes in place (local paths only); review-required suggestions remain unchanged
 - `--fail-on <severity>` — exit code 2 if any finding at/above severity exists (`critical|high|medium|low`), for CI
 
 ```bash
 npx @pradeeppilot/scale-audit ./my-app --format md --out report.md
-npx @pradeeppilot/scale-audit ./my-app --diff > fixes.patch && git apply fixes.patch
+npx @pradeeppilot/scale-audit ./my-app --diff > fixes.patch
+# Review fixes.patch before applying it:
+git apply --check fixes.patch && git apply fixes.patch
 npx @pradeeppilot/scale-audit ./my-app --fix
 npx @pradeeppilot/scale-audit ./my-app --fail-on high
 ```
 
+Local inputs can be a folder or an individual `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, or `.cjs` source file:
+
+```bash
+npx @pradeeppilot/scale-audit ./src/server.mts --format md
+```
+
+Single-file audits analyze only the selected file (including for `--diff` and `--fix`). The nearest valid parent `package.json` selects the project root (stopping at a Git boundary), and package/Prisma metadata are read from that project; lifecycle findings cannot account for sibling source files. Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are excluded.
+
+JSON reports include `coverage` with discovered and analyzed source counts and skipped paths/reasons. Markdown and HTML show the same accounting and warn when files were skipped or no source was analyzed. Counts cover eligible discovered source files after the normal directory, hidden-file, symlink, and test exclusions; excluded paths are not included. Scores apply only to analyzed source, and skipped files can still contain issues.
+
+Timeout detection checks the configuration position for each Axios method, recognizes positive literal Axios timeouts and explicit timer signals, and applies `axios.create()` defaults only to the corresponding variable binding. References to mutable defaults or client reassignment make inherited settings uncertain. Unsupported fetch timeout properties, disabled Axios timeouts, and Node HTTP timeout events alone do not establish request cancellation. Configurations that cannot be resolved are reported with low confidence.
+
 ## Automated fixes
 
-`--diff` turns findings into a real, reviewable patch. Every change is anchored to an exact AST offset, so the result is valid code, and the output is a standard unified diff you can pipe straight into `git apply`:
+`--diff` turns supported findings into a reviewable unified patch. Changes use AST offsets and pass syntax validation; ambiguous same-line calls and unsupported configurations are left for manual repair. Syntax validity does not guarantee type correctness or preserve application behavior. Review the patch before using `git apply`:
 
 ```diff
 --- a/apps/web/app/api/users/route.ts
@@ -76,7 +90,7 @@ npx @pradeeppilot/scale-audit ./my-app --fail-on high
  }
 ```
 
-`--fix` applies the same patch to the working tree. Both are opt-in: a plain audit never writes to the target repository.
+`--fix` applies only file plans whose edits are all marked safe. Pagination changes (which can truncate results) and added `await`s require review and are offered only by `--diff`; if a file contains any review-required edit, `--fix` skips that entire file. Raw SQL is never automatically rewritten. Existing cancellation/timeout options, variable configs, changed files, and symlinked paths are not overwritten. Reports distinguish generated suggestions from edits actually applied. Both modes are opt-in: a plain audit never writes to the target repository.
 
 ## Detectors
 
@@ -94,23 +108,31 @@ npx @pradeeppilot/scale-audit ./my-app --fail-on high
 
 The score is a **weighted average of per-category scores**, not a sum of penalties.
 
+- All nine detector categories contribute to a fixed scoring baseline, including categories with no findings. Adding findings cannot improve the score. Unknown categories add penalties against the same baseline.
 - Each category is scored out of 100 on its own, so you can see exactly where the risk is (`DB 30/100`).
 - Within an issue class the penalty decays: the worst finding counts in full, the next counts half, and so on, with a cap per class. One repeated issue cannot pin a large repo at 0.
 - Low-confidence findings count half.
 - Categories are weighted by how much they matter under load: DB and Concurrency weigh 4, Performance weighs 1.
 
-This keeps the number comparable between a 70-file app and a 700-file monorepo, and comparable between a young project and a mature one.
+Scores use the fixed baseline and differ from earlier releases that averaged only affected categories. This keeps the number comparable between a 70-file app and a 700-file monorepo, and comparable between a young project and a mature one.
 
 ## Precision
+
+Local identity resolution follows relative imports, named/default/star re-exports, namespace imports and common CommonJS exports among analyzed files. TypeScript `baseUrl`/`paths`, nested JSONC configs and repository-local relative `extends` are supported. Resolution never loads target packages or external configs; computed imports, package exports maps and external config packages can require manual review.
+
+Synchronous I/O findings use conservative module reachability: CLI entry points (Node shebangs or package bins) and explicit Node child-process/worker-thread URL launches propagate their context through local runtime imports. Calls reachable only from these entries are informational; a request entry reaching the same helper takes precedence. Request paths, common route/server registrations, and request/response callback signatures provide request evidence. Type-only imports do not execute and do not propagate context. This is static evidence from the analyzed files, not proof of every runtime call path; external consumers and dynamically computed imports can limit classification.
 
 A linter that cries wolf gets uninstalled, so every finding is grounded in evidence:
 
 - A capitalised receiver is only treated as a database model when there is proof — it is bound to a model factory, imported from an entity/model path, or present in a Prisma schema. `UserService.find()` is not a database read.
-- Aggregates (`count`, `aggregate`, `groupBy`) are bounded by construction and are never reported.
+- Scalar counts and Prisma aggregate objects are treated as bounded. Grouped results and aggregation pipelines still need a cap; offsets and cursors alone do not cap result counts. Pagination uses the final effective option or chained cap and does not treat MongoDB/Mongoose filter fields as options.
 - A module-level `Map`/`Set` that is only filled at import time is a constant, not runtime state.
-- A client built in a constructor or assigned to a field is a singleton, not a per-request pool.
+- Pool lifetime checks recognize guarded initialization of shared module bindings and classes constructed inside functions across local imports and re-exports. A guard that yields before initialization is still reported. Registered Nest providers track default singleton, request and transient lifetimes, constructor/token injection, and request-scope propagation. Singleton factories stay quiet; unresolved scopes and transient per-consumer allocations are informational. Static Nest dynamic-module returns and known provider-array spreads are followed without executing registration methods. Awilix registrations, Inversify binding chains, and TSyringe decorators/registrations track shared roots, child scopes, aliases, and visible constructor dependencies through local imports. Handler resolution distinguishes transient/per-resolution lifetimes from cached singletons and container-scoped instances; Inversify request scope means one resolution plan. Nest token lookup respects module providers, imports, exports and visible global modules. Private, unreferenced setup functions do not replace live registrations, and uncertain configuration paths do not prove singleton reuse. Factory helper memoization includes every known container argument; Inversify constructor type injection follows the analyzed compiler metadata settings. Class construction sites are indexed once under a work budget. Ordinary container resolution uses the active registration and Inversify name/tag constraints; bulk resolution retains multiple bindings. Singleton lifetime accounts for registration frequency, including per-request registrations and recognized once-only guards. Factory lifetimes follow visible helper calls and nested resolutions, including TSyringe array injection and zero-argument class fallback, Nest property injection, and Awilix build resolvers. Known registration spreads, shorthand properties, chained container registration, property injection, Awilix CLASSIC/proxy dependencies, and constant token aliases are supported. Request evidence follows named and exported-arrow handlers, Fastify route objects, visible array callbacks, and called local helpers, while startup scopes and static class initialization are kept separate from instance construction. Static metadata keeps spread override order and alternative module returns. Expression depth, metadata expansion, map operations, export reachability and lifetime traversal have work limits; exceeding a budget fails the audit explicitly rather than silently omitting findings. Arbitrary runtime-generated registrations, registration arguments computed by executing functions, container mutation, and computed tokens still require manual review. Known database factories such as `createPool()` are checked alongside constructors; unrelated local `Client` classes are ignored.
 - Query-builder methods (`select`, `from`, `where`) are not reads on their own; only the completed chain is.
 - GraphQL/SDK clients (`client.query({ query })`) are not mistaken for raw SQL.
+- Locally shadowed `fetch`/`axios` bindings and Axios utility exports are excluded from HTTP findings and timeout fixes; supported ESM/CommonJS import aliases retain their identity. Native `globalThis.fetch` and `undici.fetch` are also recognized.
+- Raw SQL checks evaluate each statement separately, ignore comments, quoted values and subquery-only limits, and distinguish scalar aggregates and non-returning writes from row reads. SQL analysis is conservative and is not a full dialect parser.
+- Missing-index checks descend into logical groups and known scalar filter operators while leaving relation subtrees separate. Deferred function declarations inside loops do not count as executed N+1 queries. Bare rejected promises and ineffective `.catch()` handlers are reported.
 - Findings carry `confidence`; ambiguous cases (query or config passed as a variable) are reported as `low` instead of asserted.
 - A request path is matched on whole path segments, so `capitalize.ts` is not treated as an API route.
 
@@ -124,7 +146,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Pradeeppilotdev/Scale-audit/.github/actions/scale-audit@main
         with:
           fail-on: high
@@ -141,14 +163,18 @@ npm run build
 npm run serve          # http://127.0.0.1:8787
 ```
 
-- Production-safe defaults: binds `127.0.0.1`, accepts **public github.com URLs only**, caps in-memory jobs, rejects symlinked/size-limit-exceeding files.
-- For local development on a local folder: `SCALE_AUDIT_ALLOW_LOCAL=1 npm run serve`.
-- Jobs are in-memory and analysis runs in-process; a real queue/DB/worker is the next milestone.
+- Local-preview defaults: binds `127.0.0.1`, restricts remote inputs to **github.com repository URLs**, requires JSON, validates Host/Origin, and limits request bodies to 10,000 bytes.
+- Audits run in killable child processes with a 120-second deadline, a 512 MB V8 heap limit, a 2 MB report limit, and no inherited Git credentials/configuration. These are not OS-level sandbox, total-RSS, or clone-disk quotas.
+- At most 200 jobs are retained, with 2 audits running concurrently; completed reports expire after 15 minutes and responses use `Cache-Control: no-store`.
+- For local development on a local folder: `SCALE_AUDIT_ALLOW_LOCAL=1 npm run serve`. This lets local clients request audits of readable local folders; do not expose this mode to other users.
+- Report UUIDs are bearer links, not authenticated accounts. Keep the preview local; public hosting still needs authentication, OS/container isolation and disk/network quotas.
 
 ## Safety
 
 - Never executes target code; static readers only.
-- Clones are deleted after analysis.
+- CLI clones are deleted after analysis; web audit temporary directories are also cleaned up on failure, timeout and shutdown.
+- Repository readers reject path traversal, symlinked files/ancestors, non-regular files and files over 1 MB. Aggregate input limits are 20 MB of source, 10 MB of Prisma schemas and 5 MB of manifests; traversal and file-count limits fail the audit explicitly.
+- Individual unsafe or oversized files are skipped, so a clean report is not proof that every repository file was analyzed.
 - Test/examples/docs folders are skipped for detector noise.
 - `--fix` is opt-in and only ever touches a local path you passed in.
 
@@ -160,4 +186,4 @@ npm test
 npm run build
 ```
 
-Requires Node.js 22.23.4+, 24.22.1+, or 26.12.1+ (Oct 2026 security patches). Node 20 is EOL and unsupported.
+Requires Node.js `^22.23.4 || ^24.22.1 || >=26.12.1` (Oct 2026 security patches). Node 20 is EOL and unsupported. The CLI and server reject unsupported runtime versions at startup; `.npmrc` also enforces engines for contributors. CI selects the newest available patch within supported release ranges. Self-hosted GitHub Actions runners must support the current Node 24-based Actions.

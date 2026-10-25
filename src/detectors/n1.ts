@@ -17,25 +17,26 @@ export async function detectNPlusOne(root: string, ws?: Workspace): Promise<Find
 
 function walk(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, ctx: FileContext, out: Finding[], loopDepth: number) {
   let depth = loopDepth;
+  if (ts.isFunctionLike(node)) {
+    let container: ts.Node = node;
+    while (ts.isParenthesizedExpression(container.parent)) container = container.parent;
+    const parent = container.parent;
+    const immediate = ts.isCallExpression(parent) && (parent.expression === container ||
+      (parent.arguments[0] === container && ts.isPropertyAccessExpression(parent.expression) && LOOP_CALLEE.has(parent.expression.name.text)));
+    if (!immediate) depth = 0;
+  }
   if (isLoop(node)) depth += 1;
 
-  if (depth > 0 && ts.isAwaitExpression(node) && ts.isCallExpression(node.expression) && isOrmCall(node.expression, ctx)) {
+  const returnedCall = ts.isCallExpression(node) && (ts.isReturnStatement(node.parent)
+    || (ts.isArrowFunction(node.parent) && node.parent.body === node));
+  const call = ts.isAwaitExpression(node) && ts.isCallExpression(node.expression) ? node.expression : returnedCall ? node : undefined;
+  if (depth > 0 && call && isOrmCall(call, ctx)) {
     const ln = lineOf(sf, node);
-    out.push(
-      makeFinding({
-        id: "n-plus-one",
-        category: "DB",
-        severity: "high",
-        confidence: "medium",
-        file: rel,
-        line: ln,
-        message: "ORM/database call awaited inside a loop; this is an N+1 pattern that scales poorly.",
-        scaleTrigger: "Breaks as list/collection sizes grow: O(n) DB round-trips per request.",
-        suggestedFix: "Batch the read (e.g. Prisma findMany with `in`, or a join) and hydrate in memory; or prefetch related rows.",
-        snippet: snippetAt(content, ln),
-      }),
-    );
-    return; // don't traverse further inside this await
+    out.push(makeFinding({ id: "n-plus-one", category: "DB", severity: "high", confidence: "medium",
+      file: rel, line: ln, message: "ORM/database call repeated inside a loop or collection callback; this is an N+1 pattern.",
+      scaleTrigger: "One database round-trip per item grows with collection size, even when executed concurrently.",
+      suggestedFix: "Batch queries with an IN filter or join instead of one read per item.", snippet: snippetAt(content, ln) }));
+    return;
   }
 
   ts.forEachChild(node, (c) => walk(c, sf, content, rel, ctx, out, depth));

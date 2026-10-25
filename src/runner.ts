@@ -16,6 +16,7 @@ import type { Fingerprint, Finding, Report } from "./types.js";
 import { Workspace } from "./workspace.js";
 import { planCodemod, renderDiff, applyPlan } from "./codemod.js";
 import { scoreFindings, type AuditOptions } from "./scoring.js";
+import { assertSupportedNode } from "./runtime.js";
 
 const SEVERITY_RANK: Record<Finding["severity"], number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -39,10 +40,11 @@ const DETECTORS = [
 ] as const;
 
 export async function runAudit(input: string, options: AuditOptions = {}): Promise<Report> {
-  const { root, commit, cleanup } = await resolveRepo(input);
+  assertSupportedNode();
+  const { root, commit, cleanup, sourceFile } = await resolveRepo(input);
   try {
-    const fingerprint = await fingerprintRepo(root);
-    const ws = await Workspace.load(root);
+    const fingerprint = await fingerprintRepo(root, sourceFile);
+    const ws = await Workspace.load(root, sourceFile);
 
     const findings: Finding[] = [];
     const results = await Promise.all(DETECTORS.map((d) => d(root, ws)));
@@ -67,12 +69,17 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     }
 
     const notes: string[] = [];
+    if (ws.coverage.skipped.length || ws.coverage.analyzed === 0) {
+      notes.push(`Incomplete source coverage: analyzed ${ws.coverage.analyzed} of ${ws.coverage.discovered} discovered source files; ${ws.coverage.skipped.length} skipped. The score reflects analyzed files only.`);
+    }
+    if (sourceFile) notes.push("Single-file audit: findings and lifecycle checks are limited to this file; sibling source files were not analyzed.");
     if (!fingerprint.hasTests) notes.push("No tests detected; confidence in findings is lower.");
     if (!fingerprint.hasCI) notes.push("No CI configuration detected.");
     if (fingerprint.sourceFileCount > 20000) notes.push("Large repo; analysis may be incomplete due to caps.");
 
     const report: Report = {
       repo: input,
+      coverage: ws.coverage,
       commit,
       scannedAt: new Date().toISOString(),
       fingerprint,
@@ -91,7 +98,9 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
         patched: plan.patched,
         unpatched: plan.unpatched,
         edits: plan.files.flatMap((f) => f.edits),
-        applied: options.codemod === "apply",
+        manual: plan.manual,
+        applied: written.length > 0,
+        appliedEdits: plan.files.filter((file) => written.includes(file.file)).reduce((total, file) => total + file.edits.length, 0),
         files: written,
       };
     }

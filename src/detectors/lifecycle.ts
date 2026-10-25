@@ -1,5 +1,4 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
+import { isRecord, parseRepoManifest, readRepoFile } from "../repoFiles.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
@@ -11,9 +10,11 @@ const ROUTE_METHODS = new Set(["get", "post", "put", "patch", "delete", "all", "
 export async function detectLifecycle(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
 
-  let pkg: any = {};
-  try { pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")); } catch {}
-  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+  const pkg = parseRepoManifest(await readRepoFile(root, "package.json"));
+  const deps = {
+    ...(isRecord(pkg.dependencies) ? pkg.dependencies : {}),
+    ...(isRecord(pkg.devDependencies) ? pkg.devDependencies : {}),
+  };
   const hasServerFramework = Boolean(deps.express || deps.fastify || deps["@nestjs/core"] || deps.koa || deps["@hapi/hapi"] || deps.next);
 
   const workspace = ws ?? (await Workspace.load(root));
