@@ -84,9 +84,12 @@ export class SourceProject {
       const base = path.posix.normalize(candidate);
       if (base.startsWith("../") || path.posix.isAbsolute(base)) continue;
       const extension = path.posix.extname(base);
-      const replacements: Record<string, string[]> = { ".js": [".ts", ".tsx", ".js"], ".mjs": [".mts", ".mjs"], ".cjs": [".cts", ".cjs"], ".jsx": [".tsx", ".jsx"] };
+      const replacements: Record<string, string[]> = { ".js": [".ts", ".tsx", ".js", ".jsx"], ".mjs": [".mts", ".mjs"], ".cjs": [".cts", ".cjs"], ".jsx": [".tsx", ".ts", ".jsx", ".js"] };
+      const extensions = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"];
+      // TypeScript probes every direct file before falling back to a directory
+      // index. Interleaving these can bind ./db to db/index.ts over db.tsx.
       const files = replacements[extension]?.map(ext => base.slice(0, -extension.length) + ext)
-        ?? [base, ...[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"].flatMap(ext => [base + ext, base + "/index" + ext])];
+        ?? [base, ...extensions.map(ext => base + ext), ...extensions.map(ext => base + "/index" + ext)];
       for (const file of files) if (this.sources.has(file)) return file;
     }
     return undefined;

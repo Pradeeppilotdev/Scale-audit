@@ -49,7 +49,21 @@ export function providerLifetimes(workspace: Workspace): Map<ts.Node, ProviderLi
             : !options || (!injectable && ts.isStringLiteralLike(options)) ? "singleton" : "unknown";
         }
         const dependencies: Token[] = [];
-        for (const member of node.members) if (ts.isConstructorDeclaration(member)) for (const parameter of member.parameters) {
+        // Nest inherits constructor injection when a subclass has no own
+        // constructor; property injection is inherited independently.
+        const lineage: ts.ClassDeclaration[] = [];
+        const visited = new Set<ts.Node>();
+        let current: ts.Node | undefined = node;
+        while (current && ts.isClassDeclaration(current) && !visited.has(current)) {
+          budget.take(); visited.add(current); lineage.push(current);
+          const base: ts.Expression | undefined = current.heritageClauses?.find(clause => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression;
+          current = base ? resolve(base) : undefined;
+        }
+        const constructor = lineage.map(declaration => {
+          const constructors = declaration.members.filter(ts.isConstructorDeclaration);
+          return constructors.find(member => member.body) ?? constructors[0];
+        }).find(Boolean);
+        if (constructor) for (const parameter of constructor.parameters) {
           let explicit = false;
           for (const decorator of decorators(parameter)) {
             const call = nestCall(decorator, "Inject"); if (!call?.arguments[0]) continue;
@@ -59,8 +73,12 @@ export function providerLifetimes(workspace: Workspace): Map<ts.Node, ProviderLi
           }
           if (!explicit && parameter.type && ts.isTypeReferenceNode(parameter.type)) dependencies.push(token(parameter.type.typeName));
         }
-        for (const member of node.members) if (ts.isPropertyDeclaration(member)) for (const decorator of decorators(member)) {
-          const call = nestCall(decorator, "Inject"); if (!call?.arguments[0]) continue;
+        const properties = new Map<string, ts.CallExpression>();
+        for (const declaration of [...lineage].reverse()) for (const member of declaration.members) if (ts.isPropertyDeclaration(member)) for (const decorator of decorators(member)) {
+          budget.take(); const call = nestCall(decorator, "Inject");
+          if (call?.arguments[0]) properties.set(member.name.getText(), call);
+        }
+        for (const call of properties.values()) {
           if (isRequestToken(call.arguments[0])) { kind = "request"; decorated = true; }
           else dependencies.push(token(call.arguments[0]));
         }

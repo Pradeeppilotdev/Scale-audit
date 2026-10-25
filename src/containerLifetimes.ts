@@ -13,7 +13,7 @@ type Mode = "classic" | "proxy" | "unknown";
 interface Container { api: Api; key: ts.Node | string; parent?: Container; fresh: boolean; defaultScope: Scope; mode: Mode }
 interface Selection { name?: Token; tagKey?: Token; tagValue?: Token; unknown?: boolean }
 interface Dependency extends Selection { token: Token; all?: boolean }
-interface Registration extends Selection { container: Container; token: Token; owner?: ts.Node; alias?: Token; scope: Scope; mode: Mode; implicit?: boolean; site?: ts.Node; cacheOrigin?: ts.Node; guarded?: boolean; fallback?: boolean; uncertain?: boolean }
+interface Registration extends Selection { container: Container; token: Token; owner?: ts.Node; alias?: Token; scope: Scope; mode: Mode; implicit?: boolean; site?: ts.Node; cacheOrigin?: ts.Node; guarded?: boolean; fallback?: boolean; uncertain?: boolean; branchAlternative?: boolean }
 interface Resolution extends Selection { container: Container; token: Token; site: ts.Node; all: boolean }
 
 /** Imported APIs, active registrations and visible request call paths only. Target code is never executed. */
@@ -96,8 +96,53 @@ export function containerLifetimes(workspace: Workspace): Map<ts.Node, ProviderL
     const rank = { singleton: 0, transient: 1, unknown: 2, request: 3 };
     const old = result.get(owner); if (!old || rank[lifetime.kind] > rank[old.kind]) result.set(owner, lifetime);
   };
-  const add = (c: Container, key: Token, owner: ts.Node | undefined, scope: Scope, options: Selection & { implicit?: boolean; alias?: Token; mode?: Mode; site?: ts.Node; cacheOrigin?: ts.Node; uncertain?: boolean } = {}) => {
+  // Registrations in branches are alternatives, not unconditional last writes.
+  // A statically dead branch contributes nothing; unknown conditions preserve
+  // both the existing binding and the possible replacement.
+  const truth = (expression: ts.Node): boolean | undefined => {
+    let value: ts.Node | undefined = expression, invert = false;
+    const seen = new Set<ts.Node>();
+    while (value && !seen.has(value)) {
+      budget.take(); seen.add(value);
+      if (ts.isParenthesizedExpression(value) || ts.isAsExpression(value) || ts.isSatisfiesExpression(value) || ts.isNonNullExpression(value) || ts.isTypeAssertionExpression(value)) { value = value.expression; continue; }
+      if (ts.isPrefixUnaryExpression(value) && value.operator === ts.SyntaxKind.ExclamationToken) { invert = !invert; value = value.operand; continue; }
+      if (ts.isIdentifier(value)) {
+        const declaration: ts.Declaration | undefined = symbolOf(value)?.valueDeclaration ?? definitionOf(value);
+        // Mutable flags may have changed before this registration. Only
+        // immutable primitive aliases can establish a dead/live branch.
+        if (declaration && ts.isVariableDeclaration(declaration) && ts.isVariableDeclarationList(declaration.parent) && (declaration.parent.flags & ts.NodeFlags.Const)) { value = declaration.initializer; continue; }
+        return undefined;
+      }
+      const known = value.kind === ts.SyntaxKind.TrueKeyword ? true
+        : value.kind === ts.SyntaxKind.FalseKeyword || value.kind === ts.SyntaxKind.NullKeyword ? false
+        : ts.isNumericLiteral(value) ? Number(value.text) !== 0
+        : ts.isStringLiteralLike(value) ? value.text.length !== 0 : undefined;
+      return known === undefined ? undefined : invert ? !known : known;
+    }
+    return undefined;
+  };
+  const branchState = (site: ts.Node): "live" | "dead" | "uncertain" => {
+    let state: "live" | "uncertain" = "live";
+    for (let child = site, parent = site.parent; parent; child = parent, parent = parent.parent) {
+      budget.take();
+      let condition: ts.Node | undefined, selected = true;
+      if (ts.isIfStatement(parent) && child !== parent.expression) { condition = parent.expression; selected = child === parent.thenStatement; }
+      else if (ts.isConditionalExpression(parent) && child !== parent.condition) { condition = parent.condition; selected = child === parent.whenTrue; }
+      else if (ts.isBinaryExpression(parent) && child === parent.right && (parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken || parent.operatorToken.kind === ts.SyntaxKind.BarBarToken)) {
+        condition = parent.left; selected = parent.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken;
+      }
+      if (!condition) continue;
+      const known = truth(condition);
+      if (known !== undefined && known !== selected) return "dead";
+      if (known === undefined) state = "uncertain";
+    }
+    return state;
+  };
+  const add = (c: Container, key: Token, owner: ts.Node | undefined, scope: Scope, options: Selection & { implicit?: boolean; alias?: Token; mode?: Mode; site?: ts.Node; cacheOrigin?: ts.Node; uncertain?: boolean; branchAlternative?: boolean } = {}) => {
     budget.take();
+    const branch = options.site && branchState(options.site);
+    if (branch === "dead") return;
+    if (branch === "uncertain") options = { ...options, uncertain: true, branchAlternative: true };
     const siteOwner = options.site && enclosingFunction(options.site);
     if (siteOwner && !request(options.site!) && !initialExecution.has(siteOwner) && !factoryOwners.has(siteOwner)) {
       if (!referencedFunctions.has(siteOwner) && !exportedFunction(siteOwner)) return;
@@ -243,12 +288,23 @@ export function containerLifetimes(workspace: Workspace): Map<ts.Node, ProviderL
     }
     return false;
   };
+  const possibleRegistrations = (entries: Registration[]): Registration[] => {
+    const possible: Registration[] = []; let active: Registration | undefined;
+    for (const entry of entries) { budget.take(); if (entry.uncertain) possible.push(entry); else active = entry; }
+    const candidates = active ? possible.filter(entry => {
+      budget.take();
+      // A later definite write in the same execution supersedes an earlier
+      // conditional write. Uncalled functions may run later, so retain those.
+      return !entry.branchAlternative || !entry.site || !active!.site
+        || entry.site.getSourceFile() !== active!.site!.getSourceFile()
+        || enclosingFunction(entry.site) !== enclosingFunction(active!.site!)
+        || entry.site.getStart() > active!.site!.getStart();
+    }) : possible;
+    if (active) candidates.push(active);
+    return candidates;
+  };
   const baseline = (r: Registration) => merge(r.owner, { kind: r.unknown || r.scope === "unknown" ? "unknown" : (r.scope === "singleton" || r.scope === "container") && !r.container.fresh && !registrationFresh(r) ? "singleton" : "transient" });
-  for (const byToken of registrations.values()) for (const entries of byToken.values()) {
-    let active: Registration | undefined;
-    for (const entry of entries) { budget.take(); if (entry.uncertain) baseline(entry); else active = entry; }
-    if (active) baseline(active);
-  }
+  for (const byToken of registrations.values()) for (const entries of byToken.values()) for (const entry of possibleRegistrations(entries)) baseline(entry);
   const automatic = new Map<Container, Map<Token, Registration>>();
   const lookup = (c: Container, key: Token, all = false, selection: Selection = {}): Registration[] => {
     for (let level: Container | undefined = c; level; level = level.parent) {
@@ -257,10 +313,7 @@ export function containerLifetimes(workspace: Workspace): Map<ts.Node, ProviderL
       if (!entries?.length) continue;
       if (c.api !== "inversify") {
         if (all) return entries;
-        const possible: Registration[] = []; let active: Registration | undefined;
-        for (const entry of entries) { budget.take(); if (entry.uncertain) possible.push(entry); else active = entry; }
-        if (active) possible.push(active);
-        return possible;
+        return possibleRegistrations(entries);
       }
       const matches = entries.filter(entry => {
         budget.take();
@@ -322,7 +375,7 @@ export function containerLifetimes(workspace: Workspace): Map<ts.Node, ProviderL
       const metadata = projectFor(owner.getSourceFile())?.compilerOptions(owner.getSourceFile().fileName);
       const emittedInversify = registration.container.api === "inversify" && metadata?.emitDecoratorMetadata === true && ts.canHaveDecorators(owner)
         && ts.getDecorators(owner)?.some(decorator => ts.isCallExpression(decorator.expression) && imported(decorator.expression.expression, "inversify", "injectable"));
-      if (!explicit && (registration.container.api === "tsyringe" || emittedInversify) && parameter.type && ts.isTypeReferenceNode(parameter.type)) key(token(parameter.type.typeName));
+      if (!explicit && (registration.container.api === "tsyringe" && metadata?.emitDecoratorMetadata === true || emittedInversify) && parameter.type && ts.isTypeReferenceNode(parameter.type)) key(token(parameter.type.typeName));
       if (registration.container.api === "awilix") {
         if (registration.mode === "classic" && ts.isIdentifier(parameter.name)) key(`string:${parameter.name.text}`);
         if (registration.mode === "proxy" && ts.isObjectBindingPattern(parameter.name)) for (const element of parameter.name.elements) {

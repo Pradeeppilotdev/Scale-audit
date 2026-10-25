@@ -199,3 +199,17 @@ Whole-project analysis budgets scale with file count and AST size, up to a fixed
 BOM-marked UTF-16LE and UTF-16BE sources are decoded for auditing; UTF-8 (including BOM) remains supported. File limits still apply to bytes read from the descriptor. UTF-16 automated patches are left for manual repair; `--fix` never rewrites them as UTF-8.
 
 For local troubleshooting, `--debug` writes original detector exceptions and stacks to stderr. JSON/Markdown/HTML reports retain sanitized errors; HTTP workers do not enable diagnostics. Debug output can contain private paths or source details, so inspect it before sharing. Analysis-limit failures expose typed, actionable reasons even without debugging.
+
+Cross-file binding-depth exhaustion marks affected detectors incomplete; genuine import cycles remain unresolved identities. Local module resolution tries direct source files before directory indexes and uses TypeScript-style extension substitution.
+
+DI analysis preserves conditional registration alternatives, ignores statically dead branches, and follows inherited Nest injection metadata. Mutable conditions cannot prove singleton reuse. TSyringe constructor-type inference requires an analyzed config with `emitDecoratorMetadata: true`; missing or disabled metadata is uncertain, while explicit injection tokens are still followed.
+
+Precision checks distinguish imported Node HTTP APIs from shadowed local names, require native timer-signal identity for timeout proof, and avoid concurrency warnings for proven synchronous projections. Destructured results count as dependencies between awaited calls. SQL percentage caps and branch-local caps cannot establish a bound for an entire result set. These checks remain static heuristics, not execution or full framework/SQL semantic analysis.
+
+### 0.3.7 — remaining limits
+
+Async property initializers are checked by declaration identity and visible writes in the declaration source. Property mutations in other files require manual review. Subclass overrides of an inherited method's `this` property are not resolved by runtime instance type, so this pattern can still produce a false positive and needs manual review.
+
+Concurrency checks inspect executed callback work, including calls whose results are discarded. Known synchronous built-ins and inspectable synchronous helpers can stay quiet; unknown external calls and overridable untyped methods such as `x.toString()` remain conservative candidates. Primitive receiver annotations are static evidence, not runtime validation.
+
+Deferred operational changes: the 20 MB aggregate source cap remains fatal before workspace analysis; it does not produce a partial report. Any skipped source file still marks an audit incomplete and returns CLI exit 3 by default, including in the GitHub Action. These strict behaviors are unchanged in 0.3.7. SQL bounds remain conservative; an outer query reading only a bounded CTE may still be reported as unbounded.

@@ -163,7 +163,11 @@ function independent(stmtA: ts.Statement, a: ts.Expression, stmtB: ts.Statement,
     const set = new Set<string>();
     if (ts.isVariableStatement(stmt)) {
       for (const decl of stmt.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name)) set.add(decl.name.text);
+        const collect = (name: ts.BindingName): void => {
+          if (ts.isIdentifier(name)) set.add(name.text);
+          else for (const element of name.elements) if (ts.isBindingElement(element)) collect(element.name);
+        };
+        collect(decl.name);
       }
     }
     return set;

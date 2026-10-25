@@ -1,4 +1,5 @@
 import ts from "typescript";
+import { AnalysisBudget, AnalysisLimitError } from "../analysisBudget.js";
 import { lineOf, snippetAt, makeFinding, isOrmCall, chainedPagination, asObjectLiteral, DB_RECEIVER, isKnownModel } from "./common.js";
 import type { Finding } from "../types.js";
 import type { FileContext } from "../context.js";
@@ -292,20 +293,56 @@ function hasSqlLimit(sql: string): boolean {
     if (dollar) { const end = sql.indexOf(dollar[0], i + dollar[0].length); i = end < 0 ? sql.length : end + dollar[0].length; clean += " quoted_value "; continue; }
     clean += sql[i++];
   }
-  let depth = 0;
-  let top = "";
-  for (const char of clean) {
-    if (char === "(") { if (depth === 0) top += " () "; depth++; }
-    else if (char === ")") depth = Math.max(0, depth - 1);
-    else if (depth === 0) top += char;
-  }
-  return top.split(";").filter(statement => statement.trim()).every(statement => {
-    const select = /\bselect\b/i.exec(statement);
-    if (!select) return !/\breturning\b/i.test(statement);
-    const query = statement.slice(select.index);
-    if (!/\b(?:group\s+by|union|intersect|except)\b/i.test(query) && /^select\s+(?:count|sum|avg|min|max)\s*\(\)\s*(?:as\s+\w+\s*)?(?:from\b|$)/i.test(query)) return true;
-    return /\blimit\s+(?:\d+|\$\d+|\?)/i.test(query) || /\btop\s+\d+\b/i.test(query) || /\bfetch\s+(?:first|next)\s+\d+/i.test(query);
-  });
+  // TOP (10) is a row cap, not a nested SELECT. Preserve its numeric value.
+  clean = clean.replace(/\btop\s*\(\s*(\d+)\s*\)/gi, "TOP $1");
+  const budget = new AnalysisBudget("SQL bounds", Math.min(10_000_000, Math.max(50_000, sql.length * 10)));
+  const analyze = (text: string, level = 0): boolean => {
+    if (level > 64) throw new AnalysisLimitError("SQL bounds recursion limit exceeded");
+    let top = "";
+    for (let i = 0; i < text.length; i++) {
+      budget.take();
+      if (text[i] !== "(") { top += text[i]; continue; }
+      let end = i + 1, nesting = 1;
+      for (; end < text.length && nesting; end++) {
+        budget.take();
+        if (text[end] === "(") nesting++;
+        else if (text[end] === ")") nesting--;
+      }
+      if (nesting) return false;
+      const body = text.slice(i + 1, end - 1);
+      const atBranchStart = !top.trim() || /;\s*$/.test(top) || /\b(?:union|intersect|except)(?:\s+(?:all|distinct))?\s*$/i.test(top);
+      // Parenthesized set operands are queries; a FROM subquery's cap must
+      // remain hidden from its outer SELECT.
+      top += atBranchStart && /^\s*(?:select\b|with\b|\()/i.test(body)
+        ? analyze(body, level + 1) ? " SELECT TOP 1 branch " : " SELECT * branch "
+        : " () ";
+      i = end - 1;
+    }
+    return top.split(";").filter(statement => statement.trim()).every(statement => {
+      const select = /\bselect\b/i.exec(statement);
+      if (!select) return !/\breturning\b/i.test(statement);
+      const query = statement.slice(select.index);
+      const bounded = (branch: string): boolean => {
+        if (!/\bgroup\s+by\b/i.test(branch) && /^select\s+(?:count|sum|avg|min|max)\s*\(\)\s*(?:as\s+\w+\s*)?(?:from\b|$)/i.test(branch.trim())) return true;
+        return /\blimit\s+(?:\d+|\$\d+|\?)/i.test(branch)
+          || /^\s*select\s+(?:distinct\s+)?top\s+\d+\b(?!\s+(?:percent|with\s+ties)\b)/i.test(branch)
+          || /\bfetch\s+(?:first|next)\s+\d+\s+rows?\s+only\b/i.test(branch);
+      };
+      const operators = /\b(?:union|intersect|except)(?:\s+(?:all|distinct))?\b/i;
+      const parts = query.split(operators);
+      if (parts.length === 1) return bounded(query);
+      // A final LIMIT/FETCH bounds the complete set expression. TOP is branch-local.
+      const last = parts[parts.length - 1];
+      if (/\blimit\s+(?:\d+|\$\d+|\?)/i.test(last) || /\bfetch\s+(?:first|next)\s+\d+\s+rows?\s+only\b/i.test(last)) return true;
+      // UNION can add rows from every branch; INTERSECT cannot exceed either
+      // operand and EXCEPT cannot exceed its left operand.
+      return query.split(/\bunion(?:\s+(?:all|distinct))?\b/i).every(unionBranch => {
+        const left = unionBranch.split(/\bexcept(?:\s+(?:all|distinct))?\b/i)[0];
+        return left.split(/\bintersect(?:\s+(?:all|distinct))?\b/i).some(branch => bounded(branch));
+      });
+    });
+  };
+  return analyze(clean);
 }
 
 type PaginationCheck = "bounded" | "unbounded" | "unknown";

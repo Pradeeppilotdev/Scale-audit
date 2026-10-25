@@ -1,5 +1,6 @@
 import ts from "typescript";
 import { SourceProject } from "./project.js";
+import { AnalysisLimitError } from "./analysisBudget.js";
 
 const projects = new WeakMap<ts.SourceFile, SourceProject>();
 export async function initializeBindings(root: string, sources: { rel: string; sf: ts.SourceFile }[]): Promise<void> {
@@ -9,9 +10,20 @@ export async function initializeBindings(root: string, sources: { rel: string; s
 export function projectFor(sf: ts.SourceFile): SourceProject | undefined { return projects.get(sf); }
 interface Binding { declaration?: ts.Declaration; imported?: { module: string; name: string } }
 
+/** Cycles are unknown identities; exhausted traversal is incomplete analysis. */
+function bindingStep(node: ts.Node, seen: Set<ts.Node>): Set<ts.Node> | undefined {
+  if (seen.has(node)) return undefined;
+  if (seen.size > 128) throw new AnalysisLimitError("Binding resolution depth limit exceeded");
+  return new Set(seen).add(node);
+}
+
 
 const checkers = new WeakMap<ts.SourceFile, ts.TypeChecker>();
-/** Bind one source without loading or executing dependencies. */
+/** Bind one source without loading or executing dependencies.
+ * noLib is an identity invariant: native globals have no declaration, while
+ * locally shadowed globals do. HTTP, timer and Promise checks rely on this
+ * distinction; adding ambient libraries requires changing those checks too.
+ */
 export function checkerFor(sf: ts.SourceFile): ts.TypeChecker {
   let checker = checkers.get(sf);
   if (!checker) {
@@ -41,8 +53,8 @@ function moduleBinding(sf: ts.SourceFile, module: string, name: string, seen: Se
   return exportedBinding(target, name, seen);
 }
 function exportedBinding(sf: ts.SourceFile, name: string, seen: Set<ts.Node>): Binding {
-  if (seen.has(sf) || seen.size > 128) return {};
-  const next = new Set(seen).add(sf);
+  const next = bindingStep(sf, seen);
+  if (!next) return {};
   // Explicit exports override star exports, regardless of source order.
   const star = (statement: ts.Statement) => ts.isExportDeclaration(statement) && !statement.exportClause;
   for (const statement of [...sf.statements.filter(statement => !star(statement)), ...sf.statements.filter(star)]) {
@@ -96,8 +108,9 @@ function exportedBinding(sf: ts.SourceFile, name: string, seen: Set<ts.Node>): B
   return {};
 }
 function declarationBinding(declaration: ts.Declaration | undefined, seen: Set<ts.Node>): Binding {
-  if (!declaration || seen.has(declaration) || seen.size > 128) return {};
-  const next = new Set(seen).add(declaration);
+  if (!declaration) return {};
+  const next = bindingStep(declaration, seen);
+  if (!next) return {};
   let parent: ts.Node | undefined = declaration;
   while (parent && !ts.isImportDeclaration(parent)) parent = parent.parent;
   if (parent && ts.isStringLiteral(parent.moduleSpecifier)) {
@@ -140,8 +153,8 @@ export function bindingOf(node: ts.Node, seen = new Set<ts.Node>()): Binding {
   return binding;
 }
 function resolveBinding(node: ts.Node, seen: Set<ts.Node>): Binding {
-  if (seen.has(node) || seen.size > 128) return {};
-  const next = new Set(seen).add(node);
+  const next = bindingStep(node, seen);
+  if (!next) return {};
   if (ts.isPropertyAccessExpression(node)) {
     if (ts.isCallExpression(node.expression) && node.expression.expression.getText() === "require"
       && node.expression.arguments[0] && ts.isStringLiteral(node.expression.arguments[0])) {

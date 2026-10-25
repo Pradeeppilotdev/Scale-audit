@@ -1,4 +1,4 @@
-import { checkerFor, definitionOf, isAxiosBinding, isHttpFetch } from "../bindings.js";
+import { checkerFor, definitionOf, importedBinding, isAxiosBinding, isHttpFetch, symbolOf } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
@@ -106,7 +106,6 @@ interface Target { name: string; kind: "fetch" | "axios" | "http"; defaults?: ts
 function calleeInfo(expr: ts.Expression, clients: Map<ts.Declaration, Client>, checker: ts.TypeChecker): Target | null {
   if (isHttpFetch(expr)) return { name: "fetch", kind: "fetch" };
   if (ts.isPropertyAccessExpression(expr)) {
-    const receiver = expr.expression.getText();
     const method = expr.name.getText();
     const symbol = ts.isIdentifier(expr.expression) ? checker.getSymbolAtLocation(expr.expression) : undefined;
     const declaration = definitionOf(expr.expression);
@@ -116,8 +115,14 @@ function calleeInfo(expr: ts.Expression, clients: Map<ts.Declaration, Client>, c
       return { name: `axios.${method}`, kind: "axios", defaults: client?.mutated ? undefined : client?.config,
         unknownDefaults: client ? client.mutated || !client.config : false };
     }
-    if ((receiver === "http" || receiver === "https") && method === "request") return { name: `${receiver}.request`, kind: "http" };
+    const receiver = expr.expression;
+    const binding = importedBinding(receiver);
+    const nativeHttp = binding && /^(?:node:)?https?$/.test(binding.module) && ["*", "default"].includes(binding.name);
+    const conventionalGlobal = ts.isIdentifier(receiver) && /^(http|https)$/.test(receiver.text) && !symbolOf(receiver)?.declarations?.length;
+    if ((nativeHttp || conventionalGlobal) && ["request", "get"].includes(method)) return { name: `http.${method}`, kind: "http" };
   }
+  const binding = importedBinding(expr);
+  if (binding && /^(?:node:)?https?$/.test(binding.module) && ["request", "get"].includes(binding.name)) return { name: `http.${binding.name}`, kind: "http" };
   const declaration = definitionOf(expr);
   const client = declaration && clients.get(declaration);
   if (client) return { name: "axios", kind: "axios", defaults: client.mutated ? undefined : client.config, unknownDefaults: client.mutated || !client.config };
@@ -190,12 +195,17 @@ function objectTimeoutVerdict(config: ts.ObjectLiteralExpression, kind: Target["
 }
 
 function timerSignal(expr: ts.Expression): boolean {
-  if (!ts.isCallExpression(expr)) return false;
-  if (expr.expression.getText() === "AbortSignal.timeout") {
+  if (!ts.isCallExpression(expr) || !ts.isPropertyAccessExpression(expr.expression)) return false;
+  const receiver = expr.expression.expression;
+  const globalSignal = ts.isIdentifier(receiver) && receiver.text === "AbortSignal" && !symbolOf(receiver)?.declarations?.length;
+  const qualifiedSignal = ts.isPropertyAccessExpression(receiver) && receiver.name.text === "AbortSignal"
+    && ts.isIdentifier(receiver.expression) && receiver.expression.text === "globalThis" && !symbolOf(receiver.expression)?.declarations?.length;
+  if (!globalSignal && !qualifiedSignal) return false;
+  if (expr.expression.name.text === "timeout") {
     const value = expr.arguments[0];
     return !!value && ts.isNumericLiteral(value) && Number.isSafeInteger(Number(value.text)) && Number(value.text) >= 0;
   }
-  if (expr.expression.getText() === "AbortSignal.any" && expr.arguments[0] && ts.isArrayLiteralExpression(expr.arguments[0])) {
+  if (expr.expression.name.text === "any" && expr.arguments[0] && ts.isArrayLiteralExpression(expr.arguments[0])) {
     return expr.arguments[0].elements.some((element) => ts.isExpression(element) && timerSignal(element));
   }
   return false;
