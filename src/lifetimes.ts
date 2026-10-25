@@ -1,7 +1,7 @@
 import ts from "typescript";
 import { importedBinding } from "./bindings.js";
 import { staticArray, staticExpression as resolve, staticProperty, staticReturns, isUnknownStaticValue, staticToken as token, type StaticToken as Token } from "./staticValues.js";
-import { AnalysisBudget } from "./analysisBudget.js";
+import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
 import type { Workspace } from "./workspace.js";
 
 export type Lifetime = "singleton" | "request" | "transient" | "unknown";
@@ -12,7 +12,7 @@ interface ClassMetadata { kind: Lifetime; dependencies: Token[]; decorated: bool
 
 /** Nest tokens are visible through their owning module's providers/imports/exports. */
 export function providerLifetimes(workspace: Workspace): Map<ts.Node, ProviderLifetime> {
-  const budget = new AnalysisBudget("Nest lifetime", 200_000);
+  const budget = new AnalysisBudget("Nest lifetime", projectWorkLimit(workspace.units.map(unit => unit.sf)));
   const prop = (node: ts.Node | undefined, name: string) => staticProperty(node, name, budget);
   const array = (node: ts.Node | undefined) => staticArray(node, new Set(), budget);
   const classes = new Map<ts.ClassDeclaration, ClassMetadata>();

@@ -19,6 +19,7 @@ export function renderMarkdown(report: Report): string {
   lines.push("");
   lines.push(`## Verdict`);
   lines.push("");
+  if (report.complete === false) lines.push("> **Incomplete audit.** Checks failed or source files were skipped. The score reflects successful checks only; it is not a clean bill of health.", "");
   lines.push(`**Scale score: ${report.score}/100**`);
   if (report.coverage) {
     const c = report.coverage;

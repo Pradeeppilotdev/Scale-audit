@@ -1,4 +1,4 @@
-import { AnalysisBudget } from "../analysisBudget.js";
+import { AnalysisBudget, projectWorkLimit } from "../analysisBudget.js";
 import { executionLifetimes } from "../executionLifetimes.js";
 import { requestEvidence } from "../requestEvidence.js";
 import { containerLifetimes } from "../containerLifetimes.js";
@@ -188,7 +188,7 @@ function classConstructedPerCall(node: ts.Node, lifetimes: Map<ts.Node, Provider
   let index = constructionIndices.get(context);
   if (!index) {
     index = new Map();
-    const budget = new AnalysisBudget("Class construction index", 200_000);
+    const budget = new AnalysisBudget("Class construction index", projectWorkLimit(project?.sources.values() ?? [node.getSourceFile()]));
     const pending: ts.Node[] = [...(project?.sources.values() ?? [node.getSourceFile()])];
     while (pending.length) {
       budget.take(); const candidate = pending.pop()!;

@@ -1,6 +1,6 @@
 import ts from "typescript";
 import { definitionOf } from "./bindings.js";
-import { AnalysisBudget } from "./analysisBudget.js";
+import { AnalysisBudget, AnalysisLimitError } from "./analysisBudget.js";
 
 export type StaticToken = string | ts.Node;
 
@@ -11,7 +11,7 @@ export function staticExpression(node: ts.Node | undefined, seen = new Set<ts.No
   while (current) {
     budget.take();
     if (visited.has(current)) return unknownStaticValue();
-    if (visited.size >= 256) throw new Error("Static expression recursion limit exceeded");
+    if (visited.size >= 256) throw new AnalysisLimitError("Static expression recursion limit exceeded");
     visited.add(current);
     if (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isSatisfiesExpression(current) || ts.isNonNullExpression(current) || ts.isAwaitExpression(current) || ts.isTypeAssertionExpression(current)) { current = current.expression; continue; }
     if (ts.isIdentifier(current) || ts.isPropertyAccessExpression(current)) {
@@ -42,7 +42,7 @@ export function staticProperties(object: ts.Node | undefined, budget = new Analy
   const resolved = staticExpression(object, new Set(), budget);
   const result = new Map<string, ts.Node>();
   if (!resolved || !ts.isObjectLiteralExpression(resolved)) return result;
-  if (seen.has(resolved) || seen.size > 64) throw new Error("Static metadata recursion limit exceeded");
+  if (seen.has(resolved) || seen.size > 64) throw new AnalysisLimitError("Static metadata recursion limit exceeded");
   const next = new Set(seen).add(resolved);
   const invalidate = () => { budget.take(result.size); result.clear(); result.set("*", unknownStaticValue()); };
   for (const property of resolved.properties) {
@@ -75,7 +75,7 @@ export function staticArray(node: ts.Node | undefined, seen = new Set<ts.Node>()
   budget.take();
   const resolved = staticExpression(node, new Set(), budget);
   if (!resolved || !ts.isArrayLiteralExpression(resolved)) return node ? [unknownStaticValue()] : [];
-  if (seen.has(resolved) || seen.size > 64) throw new Error("Static array recursion limit exceeded");
+  if (seen.has(resolved) || seen.size > 64) throw new AnalysisLimitError("Static array recursion limit exceeded");
   const next = new Set(seen).add(resolved);
   const result: ts.Expression[] = [];
   for (const element of resolved.elements) {
@@ -103,7 +103,7 @@ export function staticReturns(call: ts.CallExpression): ts.Expression[] {
     if (argument) argumentsByParameter.set(method.parameters[i], argument);
   }
   const truth = (node: ts.Expression, depth = 0): boolean | undefined => {
-    budget.take(); if (depth > 64) throw new Error("Static condition recursion limit exceeded");
+    budget.take(); if (depth > 64) throw new AnalysisLimitError("Static condition recursion limit exceeded");
     const definition = definitionOf(node);
     const argument = definition && argumentsByParameter.get(definition);
     if (argument) return truth(argument, depth + 1);
@@ -120,7 +120,7 @@ export function staticReturns(call: ts.CallExpression): ts.Expression[] {
   };
   const result: ts.Expression[] = [];
   const returned = (expression: ts.Expression, depth = 0) => {
-    budget.take(); if (depth > 64) throw new Error("Static return recursion limit exceeded");
+    budget.take(); if (depth > 64) throw new AnalysisLimitError("Static return recursion limit exceeded");
     const value = staticExpression(expression, new Set(), budget);
     if (value && ts.isConditionalExpression(value)) {
       const condition = truth(value.condition);
@@ -129,7 +129,7 @@ export function staticReturns(call: ts.CallExpression): ts.Expression[] {
     } else result.push(expression);
   };
   const collect = (node: ts.Node, depth = 0): boolean => {
-    budget.take(); if (depth > 64) throw new Error("Static return recursion limit exceeded");
+    budget.take(); if (depth > 64) throw new AnalysisLimitError("Static return recursion limit exceeded");
     if (ts.isFunctionLike(node)) return false;
     if (ts.isReturnStatement(node) && node.expression) { returned(node.expression); return true; }
     if (ts.isBlock(node)) { for (const statement of node.statements) if (collect(statement, depth + 1)) return true; return false; }

@@ -75,7 +75,8 @@ export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
   let unpatched = 0;
 
   for (const [rel, fileFindings] of byFile) {
-    const content = readRepoFileSync(root, rel);
+    // UTF-16 is auditable, but patches require UTF-8 byte-for-byte validation.
+    const content = readRepoFileSync(root, rel, undefined, false);
     const sf = content === null ? null : parse(rel, content);
     if (content === null || !sf) {
       unpatched += fileFindings.length;

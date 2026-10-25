@@ -1,6 +1,6 @@
 import ts from "typescript";
 import { staticExpression } from "./staticValues.js";
-import { AnalysisBudget } from "./analysisBudget.js";
+import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
 import type { Workspace } from "./workspace.js";
 import type { ProviderLifetime } from "./lifetimes.js";
 import { requestEvidence } from "./requestEvidence.js";
@@ -28,7 +28,7 @@ export function constructionCalls(owner: ts.Node, budget: AnalysisBudget): ts.Ca
 /** Propagate execution lifetimes through visible local calls. Mixed request and
  * cached callers retain the riskier lifetime; no target function is executed. */
 export function executionLifetimes(workspace: Workspace, seeds: Map<ts.Node, ProviderLifetime>): Map<ts.Node, ProviderLifetime> {
-  const result = new Map(seeds), budget = new AnalysisBudget("Factory call graph", 200_000);
+  const result = new Map(seeds), budget = new AnalysisBudget("Factory call graph", projectWorkLimit(workspace.units.map(unit => unit.sf)));
   const request = requestEvidence(workspace);
   const edges = new Map<ts.Node, Set<ts.Node>>();
   const rank = { singleton: 0, transient: 1, unknown: 2, request: 3 };

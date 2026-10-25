@@ -68,8 +68,20 @@ function unchanged(root: string, rel: string, before: Stats, after: Stats, maxBy
 const READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 const CHUNK_BYTES = 64 * 1024;
 
+/** Decode BOM-marked TypeScript text only after bounded descriptor validation. */
+function decodeRepoText(bytes: Buffer, allowUtf16 = true): string | null {
+  if (bytes.length >= 2 && ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))) {
+    if (!allowUtf16 || (bytes.length - 2) % 2 !== 0) return null;
+    const text = bytes.subarray(2);
+    if (bytes[0] === 0xff) return text.toString("utf16le");
+    return Buffer.from(text).swap16().toString("utf16le");
+  }
+  // Retain the UTF-8 BOM so existing codemod byte comparisons preserve it.
+  return bytes.toString("utf8");
+}
+
 /** Bounded, regular-file-only read. Unsafe, missing and over-limit files return null. */
-export function readRepoFileSync(root: string, rel: string, maxBytes = DEFAULT_MAX_FILE_BYTES): string | null {
+export function readRepoFileSync(root: string, rel: string, maxBytes = DEFAULT_MAX_FILE_BYTES, allowUtf16 = true): string | null {
   if (!validLimit(maxBytes)) return null;
   let fd: number | undefined;
   try {
@@ -89,7 +101,7 @@ export function readRepoFileSync(root: string, rel: string, maxBytes = DEFAULT_M
       chunks.push(chunk.subarray(0, n));
     }
     if (!unchanged(checked.root, rel, before, fs.fstatSync(fd), maxBytes)) return null;
-    return Buffer.concat(chunks, total).toString("utf8");
+    return decodeRepoText(Buffer.concat(chunks, total), allowUtf16);
   } catch {
     return null;
   } finally {
@@ -118,7 +130,7 @@ export async function readRepoFile(root: string, rel: string, maxBytes = DEFAULT
       chunks.push(chunk.subarray(0, n));
     }
     if (!unchanged(checked.root, rel, before, await handle.stat(), maxBytes)) return null;
-    return Buffer.concat(chunks, total).toString("utf8");
+    return decodeRepoText(Buffer.concat(chunks, total));
   } catch {
     return null;
   } finally {

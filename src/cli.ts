@@ -8,6 +8,7 @@ import { assertSupportedNode } from "./runtime.js";
 const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
 
 interface Args {
+  debug: boolean;
   source: string;
   out?: string;
   format: "json" | "md";
@@ -17,6 +18,7 @@ interface Args {
 
 function parseArgs(argv: string[]): Args {
   const args = argv.slice(2);
+  let debug = false;
   let source: string | undefined;
   let out: string | undefined;
   let format: "json" | "md" = "json";
@@ -25,7 +27,9 @@ function parseArgs(argv: string[]): Args {
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--out" || a === "-o") {
+    if (a === "--debug") {
+      debug = true;
+    } else if (a === "--out" || a === "-o") {
       out = args[++i];
     } else if (a === "--fix") {
       codemod = "apply";
@@ -55,7 +59,7 @@ function parseArgs(argv: string[]): Args {
     printHelp();
     process.exit(1);
   }
-  return { source, out, format, failOn, codemod };
+  return { source, out, format, failOn, codemod, debug };
 }
 
 function printHelp() {
@@ -71,20 +75,27 @@ Options:
   --fix                  Apply safe fixes in place; skip review-required file plans (local only)
   --fail-on <severity>   Exit with code 2 when a finding at/above this severity
                          exists (critical|high|medium|low). Useful for CI.
+  --debug                Write raw detector errors/stacks to stderr (may contain private paths).
+  Exit codes: 0 complete, 1 fatal/input error, 2 severity threshold, 3 incomplete audit.
   -h, --help             Show this help.
 `);
 }
 
 async function main() {
+  let debug = false;
   try {
     assertSupportedNode();
-    const { source, out, format, failOn, codemod } = parseArgs(process.argv);
+    const args = parseArgs(process.argv);
+    debug = args.debug;
+    const { source, out, format, failOn, codemod } = args;
     if (codemod === "apply" && isRemote(source)) {
       console.error("scale-audit: --fix only works on a local path; a cloned repo is discarded after the audit.");
       process.exit(1);
     }
 
-    const report = await runAudit(source, { codemod });
+    const report = await runAudit(source, { codemod,
+      onDiagnostic: debug ? (detector, error) => console.error(`scale-audit: ${detector}:`, error) : undefined,
+    });
     const cm = report.codemod;
 
     if (codemod === "diff") {
@@ -125,8 +136,12 @@ async function main() {
         process.exitCode = 2;
       }
     }
+    if (report.complete === false) {
+      console.error("scale-audit: incomplete audit; score reflects successful checks only. No fixes were applied.");
+      process.exitCode = 3;
+    }
   } catch (err) {
-    console.error("ERROR:", err instanceof Error ? err.message : String(err));
+    console.error("ERROR:", debug && err instanceof Error ? err.stack : err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
 }

@@ -117,6 +117,8 @@ export function familyPenalty(findings: Finding[]): number {
 }
 
 export interface AuditOptions {
+  /** Opt-in local diagnostics. Never included in serialized reports. */
+  onDiagnostic?: (detector: string, error: unknown) => void;
   /** "diff" generates a patch, "apply" also writes it to disk. */
   codemod?: "diff" | "apply";
 }

@@ -1,3 +1,4 @@
+import { AnalysisLimitError } from "./analysisBudget.js";
 import { fingerprintRepo } from "./fingerprint.js";
 import { resolveRepo } from "./clone.js";
 import { detectNPlusOne } from "./detectors/n1.js";
@@ -12,7 +13,7 @@ import { detectFloatingPromises } from "./detectors/floatingPromise.js";
 import { detectSequentialAwaits } from "./detectors/sequentialAwait.js";
 import { detectPerRequestClients } from "./detectors/perRequestClient.js";
 import { detectReliability } from "./detectors/reliability.js";
-import type { Fingerprint, Finding, Report } from "./types.js";
+import type { Fingerprint, Finding, Report, DetectorStatus } from "./types.js";
 import { Workspace } from "./workspace.js";
 import { planCodemod, renderDiff, applyPlan } from "./codemod.js";
 import { scoreFindings, type AuditOptions } from "./scoring.js";
@@ -47,8 +48,19 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     const ws = await Workspace.load(root, sourceFile);
 
     const findings: Finding[] = [];
-    const results = await Promise.all(DETECTORS.map((d) => d(root, ws)));
-    for (const r of results) findings.push(...r);
+    // Invoke inside promises so synchronous throws are isolated too.
+    const results = await Promise.allSettled(DETECTORS.map(d => Promise.resolve().then(() => d(root, ws))));
+    const detectors: DetectorStatus[] = results.map((result, index) => {
+      if (result.status === "fulfilled") {
+        findings.push(...result.value);
+        return { name: DETECTORS[index].name, status: "complete" };
+      }
+      // Never expose arbitrary exception text (paths/credentials) in HTTP reports.
+      try { options.onDiagnostic?.(DETECTORS[index].name, result.reason); } catch { /* Diagnostics cannot discard a report. */ }
+      const reason = result.reason instanceof AnalysisLimitError ? result.reason.message : "Detector failed internally";
+      return { name: DETECTORS[index].name, status: "failed", reason };
+    });
+    const complete = detectors.every(d => d.status === "complete") && ws.coverage.skipped.length === 0 && ws.coverage.analyzed > 0;
 
     // also deps/CVE-ish basic signals
     findings.push(...dependencySignals(fingerprint));
@@ -69,6 +81,9 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     }
 
     const notes: string[] = [];
+    for (const detector of detectors) {
+      if (detector.status === "failed") notes.push(`Incomplete audit: ${detector.name} failed (${detector.reason}); its findings were omitted. The score reflects successful checks only.`);
+    }
     if (ws.coverage.skipped.length || ws.coverage.analyzed === 0) {
       notes.push(`Incomplete source coverage: analyzed ${ws.coverage.analyzed} of ${ws.coverage.discovered} discovered source files; ${ws.coverage.skipped.length} skipped. The score reflects analyzed files only.`);
     }
@@ -78,6 +93,8 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     if (fingerprint.sourceFileCount > 20000) notes.push("Large repo; analysis may be incomplete due to caps.");
 
     const report: Report = {
+      complete,
+      detectors,
       repo: input,
       coverage: ws.coverage,
       commit,
@@ -92,7 +109,7 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
 
     if (options.codemod) {
       const plan = planCodemod(root, findings);
-      const written = options.codemod === "apply" ? applyPlan(root, plan) : [];
+      const written = options.codemod === "apply" && complete ? applyPlan(root, plan) : [];
       report.codemod = {
         diff: renderDiff(plan),
         patched: plan.patched,

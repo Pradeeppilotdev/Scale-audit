@@ -2,7 +2,7 @@ import { constructionCalls, executionLifetimes } from "./executionLifetimes.js";
 import ts from "typescript";
 import { definitionOf, importedBinding, symbolOf, projectFor } from "./bindings.js";
 import { staticExpression as resolve, staticProperty, staticProperties, staticArray, isUnknownStaticValue, staticToken as token, type StaticToken as Token } from "./staticValues.js";
-import { AnalysisBudget } from "./analysisBudget.js";
+import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
 import { requestEvidence } from "./requestEvidence.js";
 import type { Workspace } from "./workspace.js";
 import type { ProviderLifetime } from "./lifetimes.js";
@@ -18,7 +18,7 @@ interface Resolution extends Selection { container: Container; token: Token; sit
 
 /** Imported APIs, active registrations and visible request call paths only. Target code is never executed. */
 export function containerLifetimes(workspace: Workspace): Map<ts.Node, ProviderLifetime> {
-  const budget = new AnalysisBudget("DI lifetime", 200_000);
+  const budget = new AnalysisBudget("DI lifetime", projectWorkLimit(workspace.units.map(unit => unit.sf)));
   const prop = (node: ts.Node | undefined, name: string) => staticProperty(node, name, budget);
   const result = new Map<ts.Node, ProviderLifetime>();
   const registrations = new Map<Container, Map<Token, Registration[]>>();

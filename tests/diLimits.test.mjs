@@ -16,7 +16,7 @@ const nested=depth=>`import {Module,Injectable,Scope} from '@nestjs/common';${db
 
 test('nested static metadata retains scope or fails explicitly instead of returning a clean score',async()=>{
  await audit(nested(80),r=>assert.equal(repeated(r).length,1));
- await fixture(nested(512),root=>assert.rejects(runAudit(root),/Static expression recursion limit exceeded/));
+ await fixture(nested(512),async root=>{const r=await runAudit(root);assert.equal(r.complete,false);assert.ok(r.detectors.some(d=>d.status==='failed'&&d.reason==='Static expression recursion limit exceeded'));});
 });
 test('long Nest re-export paths are stack-safe',async()=>{const n=2400;let source="import {Module,Scope} from '@nestjs/common';import {Pool} from 'pg';@Module({providers:[{provide:'CTX',useFactory:()=>({}),scope:Scope.REQUEST}],exports:['CTX']})class M0{}";for(let i=1;i<=n;i++)source+=`@Module({imports:[M${i-1}],exports:[M${i-1}]})class M${i}{}`;source+=`@Module({imports:[M${n}],providers:[{provide:'DB',inject:['CTX'],useFactory:()=>new Pool()}]})class App{}`;await audit(source,r=>assert.equal(repeated(r).length,1));});
 test('metadata invalidation and merging consume the total-work budget',()=>{const n=300;const source='const object={'+Array.from({length:n},(_,i)=>`p${i}:0`).join(',')+','+Array.from({length:n},()=>`...runtime`).join(',')+'};';const sf=ts.createSourceFile('invalidation.ts',source,ts.ScriptTarget.Latest,true);assert.throws(()=>staticProperty(sf.statements[0].declarationList.declarations[0].initializer,'p0',new AnalysisBudget('Invalidation probe',n*2+2)),/analysis work budget exceeded/);});

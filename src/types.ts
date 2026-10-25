@@ -79,7 +79,16 @@ export interface AuditCoverage {
   skipped: { file: string; reason: string }[];
 }
 
+export interface DetectorStatus {
+  name: string;
+  status: "complete" | "failed";
+  reason?: string;
+}
+
 export interface Report {
+  /** False when any detector failed or source coverage is incomplete. */
+  complete?: boolean;
+  detectors?: DetectorStatus[];
   coverage?: AuditCoverage;
   repo: string;
   commit: string | null;

@@ -187,3 +187,15 @@ npm run build
 ```
 
 Requires Node.js `^22.23.4 || ^24.22.1 || >=26.12.1` (Oct 2026 security patches). Node 20 is EOL and unsupported. The CLI and server reject unsupported runtime versions at startup; `.npmrc` also enforces engines for contributors. CI selects the newest available patch within supported release ranges. Self-hosted GitHub Actions runners must support the current Node 24-based Actions.
+
+### Audit completeness and work limits
+
+JSON reports include `complete` and per-detector `detectors` statuses. Detector failures retain findings from successful checks and mark the report incomplete. Markdown and HTML display an incomplete-audit warning; scores then describe successful checks only. Incomplete audits never apply `--fix` edits.
+
+CLI exit codes: **0** complete, **1** fatal/input error, **2** `--fail-on` threshold reached, **3** incomplete audit (takes precedence over 2). Reports are written before exit 3, including the GitHub Action PR report. HTTP audits retain incomplete reports with the same structured status and visible warning.
+
+Whole-project analysis budgets scale with file count and AST size, up to a fixed ceiling. Local static-evaluation and depth limits, filesystem safety checks, aggregate input caps, and worker memory/time/report caps remain unchanged. Failures before a workspace can be loaded, including aggregate input-limit violations, remain fatal errors; no usable detector results exist at that stage.
+
+BOM-marked UTF-16LE and UTF-16BE sources are decoded for auditing; UTF-8 (including BOM) remains supported. File limits still apply to bytes read from the descriptor. UTF-16 automated patches are left for manual repair; `--fix` never rewrites them as UTF-8.
+
+For local troubleshooting, `--debug` writes original detector exceptions and stacks to stderr. JSON/Markdown/HTML reports retain sanitized errors; HTTP workers do not enable diagnostics. Debug output can contain private paths or source details, so inspect it before sharing. Analysis-limit failures expose typed, actionable reasons even without debugging.

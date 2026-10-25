@@ -2,7 +2,7 @@ import ts from "typescript";
 import { importedBinding } from "./bindings.js";
 import { staticExpression, staticProperty } from "./staticValues.js";
 import type { Workspace } from "./workspace.js";
-import { AnalysisBudget } from "./analysisBudget.js";
+import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
 
 type FunctionNode = ts.SignatureDeclaration & ts.Node;
 function enclosingFunction(node: ts.Node): FunctionNode | undefined {
@@ -16,7 +16,7 @@ export function requestEvidence(workspace: Workspace): (node: ts.Node) => boolea
   const cached = evidenceCache.get(workspace); if (cached) return cached;
   const roots = new Set<ts.Node>();
   const edges = new Map<ts.Node, Set<ts.Node>>();
-  const budget = new AnalysisBudget("Request reachability");
+  const budget = new AnalysisBudget("Request reachability", projectWorkLimit(workspace.units.map(unit => unit.sf)));
   const httpReceiver = (node: ts.Node): boolean => {
     const value = staticExpression(node);
     if (value && (ts.isCallExpression(value) || ts.isNewExpression(value))) {

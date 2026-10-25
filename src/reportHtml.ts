@@ -59,6 +59,7 @@ export function renderHtml(report: Report): string {
 <div class="wrap">
   <h1>Scale-Readiness Report</h1>
   <div class="muted">${esc(report.repo)}${report.commit ? ` @ ${esc(report.commit.slice(0, 12))}` : ""}</div>
+  ${report.complete === false ? "<p role=\"alert\"><b>Incomplete audit. The score reflects successful checks only; some checks failed or source files were skipped.</b></p>" : ""}
   <div class="score">${report.score}/100</div>
   ${report.coverage ? `<p>Source coverage: ${report.coverage.analyzed}/${report.coverage.discovered} analyzed; ${report.coverage.skipped.length} skipped.</p>${report.coverage.skipped.length || report.coverage.analyzed === 0 ? "<p><b>Incomplete source coverage. This score applies only to analyzed files.</b></p>" : ""}<ul>${report.coverage.skipped.map((s) => `<li>Skipped ${esc(s.file)}: ${esc(s.reason)}</li>`).join("")}</ul>` : ""}
   <div class="muted">Scanned ${esc(report.scannedAt)} · ${report.fingerprint.sourceFileCount} source files · ${esc(report.fingerprint.framework ?? "unknown framework")}${report.fingerprint.projectType !== "unknown" ? ` · ${esc(report.fingerprint.projectType)}` : ""}</div>
