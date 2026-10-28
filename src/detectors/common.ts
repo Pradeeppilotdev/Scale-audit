@@ -24,9 +24,16 @@ export async function readFileSafe(root: string, rel: string): Promise<string | 
   return readRepoFile(root, rel);
 }
 
-export function parseSource(rel: string, content: string): ts.SourceFile | null {
+export function parseSource(rel: string, content: string, module = /\.(mts|mjs)$/.test(rel)): ts.SourceFile | null {
   try {
-    return ts.createSourceFile(rel, content, ts.ScriptTarget.Latest, true, scriptKindOf(rel));
+    // Module context must be present during parsing: otherwise `await (x)` in
+    // an import-free ESM file is parsed as a call to an identifier named await.
+    const options: ts.CreateSourceFileOptions = { languageVersion: ts.ScriptTarget.Latest };
+    if (module) {
+      options.impliedNodeFormat = ts.ModuleKind.ESNext;
+      options.setExternalModuleIndicator = file => { Object.assign(file, { externalModuleIndicator: true }); };
+    }
+    return ts.createSourceFile(rel, content, options, true, scriptKindOf(rel));
   } catch {
     return null;
   }

@@ -86,6 +86,10 @@ export interface DetectorStatus {
 }
 
 export interface Report {
+  /** Optional for compatibility with reports created before schema versioning. */
+  schemaVersion?: 1;
+  analyzer?: { name: string; version: string };
+  analysisScope?: { purpose: string; limitations: string[] };
   /** False when any detector failed or source coverage is incomplete. */
   complete?: boolean;
   detectors?: DetectorStatus[];

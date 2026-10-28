@@ -31,14 +31,18 @@ function parseArgs(argv: string[]): Args {
       debug = true;
     } else if (a === "--out" || a === "-o") {
       out = args[++i];
+      if (!out || out.startsWith("-")) throw new Error("--out requires a file path");
     } else if (a === "--fix") {
+      if (codemod === "diff") throw new Error("--fix and --diff cannot be combined");
       codemod = "apply";
     } else if (a === "--diff") {
+      if (codemod === "apply") throw new Error("--fix and --diff cannot be combined");
       codemod = "diff";
     } else if (a === "--verify" || a === "-v") {
       // Deprecated: the old JEV experiment. Kept as an alias for --diff.
+      if (codemod === "apply") throw new Error("--fix and --diff cannot be combined");
       console.error("scale-audit: --verify is deprecated, use --diff (or --fix) instead.");
-      codemod = codemod ?? "diff";
+      codemod = "diff";
     } else if (a === "--format") {
       const next = args[++i];
       if (next === "md" || next === "markdown") format = "md";
@@ -52,7 +56,10 @@ function parseArgs(argv: string[]): Args {
       printHelp();
       process.exit(0);
     } else if (!a.startsWith("-")) {
+      if (source) throw new Error("Exactly one audit target is supported");
       source = a;
+    } else {
+      throw new Error(`unknown option: ${a}`);
     }
   }
   if (!source) {

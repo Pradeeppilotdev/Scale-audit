@@ -1,4 +1,4 @@
-import { isRecord, parseRepoManifest, readRepoFile } from "../repoFiles.js";
+import { dependencies, processEvent, serviceContexts, type StartupContext } from "../serviceContext.js";
 import { isAxiosBinding, isHttpFetch } from "../bindings.js";
 import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
@@ -7,12 +7,11 @@ import { Workspace } from "../workspace.js";
 import { detectFloatingPromises } from "./floatingPromise.js";
 
 /**
- * Repo-level resilience gaps.
+ * Service-scoped resilience evidence.
  *
- * These are findings about the project as a whole rather than a single call
- * site: there is no retry strategy anywhere, or the process has no
- * unhandled-rejection handler, so a single failed dependency can take the
- * instance down.
+ * Retry hints stay advisory and local to a file/package. Rejection protection
+ * must be visible in every startup entry that owns the affected source; an
+ * unrelated service cannot supply that evidence.
  */
 const RETRY_PACKAGES = [
   "p-retry",
@@ -26,62 +25,83 @@ const RETRY_PACKAGES = [
   "rate-limiter-flexible",
 ];
 
-const RETRY_PATTERNS = [
-  /\bretry\s*\(/i,
-  /\bwithRetry\b/,
-  /\bretryWhen\b/,
-  /\bmaxRetries\b/,
-  /\bbackoff\b/i,
-  /\bretryCount\b/,
-  /\battempts\s*[:=]/i,
-];
-
 export async function detectReliability(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
 
-  const pkg = parseRepoManifest(await readRepoFile(root, "package.json"));
-  const deps = {
-    ...(isRecord(pkg.dependencies) ? pkg.dependencies : {}),
-    ...(isRecord(pkg.devDependencies) ? pkg.devDependencies : {}),
-  };
-
-  const hasOutboundCalls = workspace.units.some((u) => hasOutboundCall(u.sf));
-  if (hasOutboundCalls) {
+  const contexts = serviceContexts(root, workspace);
+  // Advisory evidence is scoped to the owning package and parsed source, never comments.
+  for (const unit of workspace.units) {
+    if (!hasOutboundCall(unit.sf)) continue;
+    const deps = dependencies(await contexts.manifest(unit));
     const hasRetry =
       RETRY_PACKAGES.some((p) => p in deps) ||
-      workspace.units.some((u) => RETRY_PATTERNS.some((re) => re.test(u.content)));
+      hasRetrySyntax(unit.sf);
 
     if (!hasRetry) {
-      const anchor = workspace.units.find((u) => hasOutboundCall(u.sf));
-      if (anchor) {
-        const ln = lineOf(anchor.sf, firstOutboundCall(anchor.sf));
-        out.push(
-          makeFinding({
-            id: "no-retry-strategy",
-            category: "Resilience",
-            severity: "info",
-            confidence: "low",
-            file: anchor.rel,
-            line: ln,
-            message: "The project makes outbound HTTP calls but has no retry/backoff mechanism.",
-            scaleTrigger: "A transient downstream error (429, 502, socket reset) fails the user request instead of recovering.",
-            suggestedFix: "Add bounded retries with exponential backoff and jitter on transient failures only (never on 4xx).",
-            snippet: snippetAt(anchor.content, ln),
-          }),
-        );
-      }
+      const anchor = unit;
+      const ln = lineOf(anchor.sf, firstOutboundCall(anchor.sf));
+      out.push(
+        makeFinding({
+          id: "no-retry-strategy",
+          category: "Resilience",
+          severity: "info",
+          confidence: "low",
+          file: anchor.rel,
+          line: ln,
+          message: "Outbound HTTP calls have no visible retry/backoff evidence in this file or its package dependencies.",
+          scaleTrigger: "A transient downstream error (429, 502, socket reset) fails the user request instead of recovering.",
+          suggestedFix: "For retry-safe/idempotent operations, consider bounded retries with exponential backoff and jitter; respect Retry-After for 429/503 and avoid retrying permanent failures or duplicating writes.",
+          snippet: snippetAt(anchor.content, ln),
+        }),
+      );
     }
   }
 
   // Only worth reporting when there is something to reject: a floating promise
   // plus no process-level handler means one bad write can kill the instance.
-  const floating = await detectFloatingPromises(root, workspace);
-  const hasRejectionHandler = workspace.units.some((u) => hasUnhandledRejectionHandler(u.sf));
-  if (floating.length > 0 && !hasRejectionHandler) {
-    const anchor = workspace.units.find((u) => floating.some((f) => f.file === u.rel));
-    if (anchor) {
-      const ln = floating.find((f) => f.file === anchor.rel)?.line ?? 1;
+  const sites = new Map<Finding, ts.CallExpression>();
+  const floating = await detectFloatingPromises(root, workspace, (finding, call) => sites.set(finding, call));
+  const byFile = new Map<string, Finding[]>();
+  for (const finding of floating) {
+    const local = byFile.get(finding.file) ?? [];
+    local.push(finding);
+    byFile.set(finding.file, local);
+  }
+  const protectedOwners = new Map<StartupContext, boolean>();
+  const containsHandler = (calls: ReadonlySet<ts.CallExpression>, owner: StartupContext): boolean => {
+    for (const call of calls) if (processEvent(call, ["unhandledRejection"], owner)) return true;
+    return false;
+  };
+  const hasHandler = (owner: StartupContext): boolean => {
+    const cached = protectedOwners.get(owner);
+    if (cached !== undefined) return cached;
+    const protectedOwner = containsHandler(owner.protectiveCalls, owner);
+    protectedOwners.set(owner, protectedOwner);
+    return protectedOwner;
+  };
+  const protectedSites = new Map<StartupContext, Map<ts.CallExpression, boolean>>();
+  const protectsSite = (owner: StartupContext, finding: Finding): boolean => {
+    if (hasHandler(owner)) return true;
+    const site = sites.get(finding);
+    if (!site) return false;
+    let cache = protectedSites.get(owner);
+    if (!cache) { cache = new Map(); protectedSites.set(owner, cache); }
+    const cached = cache.get(site);
+    if (cached !== undefined) return cached;
+    const invocations = owner.invocationsFor(site);
+    const protectedSite = invocations.length > 0 && invocations.every(view =>
+      containsHandler(view.protectionCallsFor(site), view));
+    cache.set(site, protectedSite);
+    return protectedSite;
+  };
+  for (const anchor of workspace.units) {
+    const local = byFile.get(anchor.rel) ?? [];
+    if (!local.length) continue;
+    const owners = contexts.owners(anchor.sf);
+    const unprotected = local.filter(finding => !owners.every(owner => protectsSite(owner, finding)));
+    if (unprotected.length) {
+      const ln = unprotected[0].line;
       out.push(
         makeFinding({
           id: "missing-rejection-handler",
@@ -90,9 +110,9 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
           confidence: "medium",
           file: anchor.rel,
           line: ln,
-          message: `This project has ${floating.length} unawaited promise(s) and no process-level \`unhandledRejection\` handler.`,
+          message: `This project has ${unprotected.length} unhandled promise finding(s) in this file without a visible startup process-level \`unhandledRejection\` handler.`,
           scaleTrigger: "One rejected promise can terminate the whole process, taking every in-flight request on that instance with it.",
-          suggestedFix: "Register `process.on('unhandledRejection', ...)` at startup, log it, and keep the process alive.",
+          suggestedFix: "Handle failures at the call site with await/catch first. At startup, log unexpected rejections and follow an explicit shutdown/restart policy; a global listener is not a substitute for handling failures.",
           snippet: snippetAt(anchor.content, ln),
         }),
       );
@@ -144,23 +164,15 @@ function firstOutboundCall(sf: ts.SourceFile): ts.Node {
   return found;
 }
 
-function hasUnhandledRejectionHandler(sf: ts.SourceFile): boolean {
+function hasRetrySyntax(sf: ts.SourceFile): boolean {
   let found = false;
   const visit = (node: ts.Node) => {
-    if (found) return;
     if (ts.isCallExpression(node)) {
-      const callee = node.expression.getText();
-      if (/^process\.(on|once)$/.test(callee)) {
-        const first = node.arguments[0];
-        if (first && (ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first))) {
-          if (/^(unhandledRejection|uncaughtException|unhandledRejectionError)$/.test(first.text)) {
-            found = true;
-            return;
-          }
-        }
-      }
+      const name = ts.isIdentifier(node.expression) ? node.expression.text
+        : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : "";
+      if (/^(retry|withRetry|retryWhen|backoff)$/i.test(name)) found = true;
     }
-    ts.forEachChild(node, visit);
+    if (!found) ts.forEachChild(node, visit);
   };
   visit(sf);
   return found;

@@ -38,3 +38,14 @@ test("reports still render older summaries without the new accounting fields", (
   assert.match(renderHtml(value), /0 edits applied/);
   assert.match(renderMarkdown(value), /0 edit\(s\) applied/);
 });
+
+test('report provenance and analysis limits render with HTML escaping', () => {
+  const value = report();
+  value.schemaVersion = 1;
+  value.analyzer = {name:'scale-audit',version:'0.3.7'};
+  value.analysisScope = {purpose:'Static system-design evidence',limitations:['Unresolved <runtime> behavior is not verified.']};
+  const md=renderMarkdown(value),html=renderHtml(value);
+  assert.match(md,/scale-audit@0.3.7/);assert.match(md,/Analysis scope/);
+  assert.match(html,/report schema 1/);assert.match(html,/&lt;runtime&gt;/);
+  assert.doesNotMatch(html,/<runtime>/);
+});

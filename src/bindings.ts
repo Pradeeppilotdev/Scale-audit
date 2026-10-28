@@ -3,9 +3,12 @@ import { SourceProject } from "./project.js";
 import { AnalysisLimitError } from "./analysisBudget.js";
 
 const projects = new WeakMap<ts.SourceFile, SourceProject>();
-export async function initializeBindings(root: string, sources: { rel: string; sf: ts.SourceFile }[]): Promise<void> {
-  const project = await SourceProject.create(root, sources);
-  for (const unit of sources) projects.set(unit.sf, project);
+export async function initializeBindings(root: string, sources: { rel: string; sf: ts.SourceFile }[], prepared?: SourceProject): Promise<void> {
+  const project = prepared ?? await SourceProject.create(root, sources);
+  for (const unit of sources) {
+    project.sources.set(unit.rel, unit.sf);
+    projects.set(unit.sf, project);
+  }
 }
 export function projectFor(sf: ts.SourceFile): SourceProject | undefined { return projects.get(sf); }
 interface Binding { declaration?: ts.Declaration; imported?: { module: string; name: string } }

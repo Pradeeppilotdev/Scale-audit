@@ -9,6 +9,7 @@ export function renderMarkdown(report: Report): string {
   lines.push("");
   lines.push(`- Repo: \`${report.repo}\``);
   if (report.commit) lines.push(`- Commit: \`${report.commit.slice(0, 12)}\``);
+  if (report.analyzer) lines.push(`- Analyzer: ${report.analyzer.name}@${report.analyzer.version} (report schema ${report.schemaVersion ?? "unknown"})`);
   lines.push(`- Scanned: ${report.scannedAt}`);
   lines.push(`- Framework: ${report.fingerprint.framework ?? "unknown"}`);
   lines.push(`- ORM: ${report.fingerprint.orm ?? "unknown"}`);
@@ -26,6 +27,10 @@ export function renderMarkdown(report: Report): string {
     lines.push("", `Source coverage: ${c.analyzed}/${c.discovered} analyzed; ${c.skipped.length} skipped.`);
     if (c.skipped.length || c.analyzed === 0) lines.push("", "> Incomplete source coverage. This score applies only to analyzed files.");
     for (const skip of c.skipped) lines.push(`- Skipped ${JSON.stringify(skip.file)}: ${skip.reason}`);
+  }
+  if (report.analysisScope) {
+    lines.push("", "### Analysis scope", "", report.analysisScope.purpose);
+    for (const limitation of report.analysisScope.limitations) lines.push(`- ${limitation}`);
   }
   if (report.fingerprint.projectType === "library") {
     lines.push("");

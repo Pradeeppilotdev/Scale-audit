@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { AnalysisLimitError } from "./analysisBudget.js";
 import { fingerprintRepo } from "./fingerprint.js";
 import { resolveRepo } from "./clone.js";
@@ -18,6 +19,9 @@ import { Workspace } from "./workspace.js";
 import { planCodemod, renderDiff, applyPlan } from "./codemod.js";
 import { scoreFindings, type AuditOptions } from "./scoring.js";
 import { assertSupportedNode } from "./runtime.js";
+
+// Read our installed package metadata, never the audited project's code.
+const analyzerPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
 
 const SEVERITY_RANK: Record<Finding["severity"], number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
@@ -62,7 +66,7 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     });
     const complete = detectors.every(d => d.status === "complete") && ws.coverage.skipped.length === 0 && ws.coverage.analyzed > 0;
 
-    // also deps/CVE-ish basic signals
+    // Dependency-presence advisories are not vulnerability findings.
     findings.push(...dependencySignals(fingerprint));
 
     const deduped = dedupeFindings(findings);
@@ -93,6 +97,16 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     if (fingerprint.sourceFileCount > 20000) notes.push("Large repo; analysis may be incomplete due to caps.");
 
     const report: Report = {
+      schemaVersion: 1,
+      analyzer: { name: analyzerPackage.name, version: analyzerPackage.version },
+      analysisScope: {
+        purpose: "Static evidence of system-design risks in Node.js/TypeScript code",
+        limitations: [
+          "Complete means eligible source and detector execution completed; unsupported or unresolved runtime behavior may still hide findings.",
+          "No deployment topology, production traffic, database query plans, or runtime capacity is verified.",
+          "This is not a dependency vulnerability scan, comprehensive security audit, or TypeScript type check.",
+        ],
+      },
       complete,
       detectors,
       repo: input,
@@ -160,21 +174,21 @@ function dedupeFindings(findings: Finding[]): Finding[] {
 function dependencySignals(fp: Fingerprint): Finding[] {
   const out: Finding[] = [];
   const deps = { ...fp.deps, ...fp.devDeps };
-  // Heavy/known risky libs
+  // Presence alone cannot establish runtime footprint or a scalability defect.
   const heavy = ["moment", "lodash", "request", "bluebird"];
   for (const lib of heavy) {
     if (deps[lib]) {
       out.push({
         id: "heavy-dependency",
         category: "Deps",
-        severity: "low",
-        confidence: "high",
+        severity: "info",
+        confidence: "low",
         file: "package.json",
         line: 1,
         snippet: `"${lib}": "${deps[lib]}"`,
-        message: `Dependency "${lib}" is heavy/deprecated-prone; consider lighter alternatives.`,
-        scaleTrigger: "Increases bundle/runtime footprint and maintenance risk.",
-        suggestedFix: "Replace with modern equivalents (e.g. dayjs/date-fns, native fetch, lodash-es tree-shaking).",
+        message: `Review runtime usage of dependency "${lib}"; package presence alone does not establish a scalability problem.`,
+        scaleTrigger: "Runtime impact depends on which code is imported, workload, and deployment packaging.",
+        suggestedFix: "Locate the owning workspace manifest and measure actual usage/footprint before deciding whether replacement is worthwhile. This advisory is not a vulnerability scan.",
       });
     }
   }

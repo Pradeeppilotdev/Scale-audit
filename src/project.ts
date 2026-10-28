@@ -9,10 +9,10 @@ export class SourceProject {
   private configs = new Map<string, Config>();
   private byFile = new Map<string, Config>();
   private budget = new RepoInputBudget("TypeScript config", MAX_MANIFEST_BYTES);
-  private constructor(private root: string, sources: { rel: string; sf: ts.SourceFile }[]) {
-    this.sources = new Map(sources.map(unit => [unit.rel, unit.sf]));
+  private constructor(private root: string, sources: { rel: string; sf?: ts.SourceFile }[]) {
+    this.sources = new Map(sources.flatMap(unit => unit.sf ? [[unit.rel, unit.sf] as const] : []));
   }
-  static async create(root: string, sources: { rel: string; sf: ts.SourceFile }[]): Promise<SourceProject> {
+  static async create(root: string, sources: { rel: string; sf?: ts.SourceFile }[]): Promise<SourceProject> {
     const project = new SourceProject(root, sources);
     const directories = new Map<string, Config>();
     for (const { rel } of sources) {

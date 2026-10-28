@@ -41,6 +41,20 @@ First bottleneck: **DB** — ORM/database call awaited inside a loop; this is an
 | I/O | 78/100 | 84 |
 ```
 
+## Purpose: system-design risks visible in code
+
+The goal is to find implementation choices that undermine a system under load: unbounded work, repeated database round-trips, incorrectly shared state, connection lifetime mistakes, missing deadlines, and gaps in service startup and failure handling. Each finding should connect code evidence to a failure scenario and a concrete repair.
+
+Static source analysis cannot establish production capacity, deployment topology, queue guarantees, data consistency, or database execution plans. A complete audit means the supported checks finished over eligible source; it does not mean every runtime behavior was understood. This tool does not replace load testing, architecture review, security scanning, or type checking.
+
+Reports include the installed analyzer version, report schema version, and explicit analysis limits. Dependency-name advisories are informational and do not reduce the score; actual runtime impact needs evidence.
+
+Lifecycle checks follow visible startup calls and runtime imports per service, including directly called local setup helpers. Health evidence must belong to the listening server or an explicitly root-mounted router. Nest health checks compose controller/method paths and follow static module imports/controllers from the application's root module. Package metadata is scoped to the nearest manifest. Conditionally started servers remain candidates for lifecycle findings, while only established startup execution supplies protection evidence. Direct helper arguments and executed parameter defaults retain their bindings; deferred generators and catch-only setup do not establish protection. Unknown external setup callbacks, constructor-driven setup, dynamic module registration, Fastify route-object health declarations and non-root router mount prefixes may require manual review. A registered route is evidence of routing, not proof that middleware sends a successful health response. Shared module summaries and a source-to-entry index avoid repeatedly traversing common imports; exhausted analysis still marks the report incomplete. Signal/rejection listeners establish registration evidence only, not proof of successful draining or recovery.
+
+Startup checks retain argument bindings and allocation identity for each helper invocation. Immutable local receiver and callback aliases preserve those bindings; destructured helper parameters remain conservative. Static imports and re-exports are evaluated before the module body. Awaited helpers and literal local imports contribute completed setup evidence to later startup work; helper evidence stays tied to its invocation, and asynchronous continuations do not protect earlier listeners. Awaited call arguments complete before the call itself starts. Known literal guards retain their evaluated execution path, while unknown guards remain uncertain. Conditional logical and optional-chain paths retain their skipped execution paths, including computed callee keys. Native rejected/pending awaits, returned awaits and finally completion overrides are distinguished. Visible Nest metadata member/array mutations are scoped to executed service owners and helper invocations; metadata aliases, property reassignment and copied-array capture are tracked alongside helper-supplied root modules. Nest metadata capture includes class static initialization. Route literals preserve erased TypeScript wrappers and captured property values. Decorator expressions follow the configured evaluation order; arbitrary returned decorator bodies remain conservative. Server discovery recognizes imported Koa constructors and Node HTTP/HTTPS factories independently of the receiver variable name. Listener discovery reuses shared summary indexes, and protection call sets are composed lazily without copying them into every entry. Traversal remains budgeted.
+
+Next priorities are baseline comparisons with reasoned suppressions, stable finding identities and SARIF export, and a repeatable real-repository precision/performance corpus. Further system-design checks should target demonstrable mechanisms such as queue backpressure, bounded caches, and retry amplification, with positive and negative examples before scoring them.
+
 ## Usage
 
 ```bash
@@ -90,7 +104,7 @@ Timeout detection checks the configuration position for each Axios method, recog
  }
 ```
 
-`--fix` applies only file plans whose edits are all marked safe. Pagination changes (which can truncate results) and added `await`s require review and are offered only by `--diff`; if a file contains any review-required edit, `--fix` skips that entire file. Raw SQL is never automatically rewritten. Existing cancellation/timeout options, variable configs, changed files, and symlinked paths are not overwritten. Reports distinguish generated suggestions from edits actually applied. Both modes are opt-in: a plain audit never writes to the target repository.
+`--fix` applies only file plans whose edits are all marked safe. Pagination changes (which can truncate results) and added `await`s require review and are offered only by `--diff`; if a file contains any review-required edit, `--fix` skips that entire file. Raw SQL is never automatically rewritten. Existing cancellation/timeout options, variable configs, changed files, and symlinked paths are not overwritten. Reports distinguish generated suggestions from edits actually applied. Both modes are opt-in: a plain audit never writes to the target repository. Combining `--fix` with `--diff` or its deprecated `--verify`/`-v` aliases is rejected before auditing or writing files, in either argument order.
 
 ## Detectors
 
@@ -196,6 +210,8 @@ CLI exit codes: **0** complete, **1** fatal/input error, **2** `--fail-on` thres
 
 Whole-project analysis budgets scale with file count and AST size, up to a fixed ceiling. Local static-evaluation and depth limits, filesystem safety checks, aggregate input caps, and worker memory/time/report caps remain unchanged. Failures before a workspace can be loaded, including aggregate input-limit violations, remain fatal errors; no usable detector results exist at that stage.
 
+Startup promise completion follows immutable aliases and statically selected logical/comma values at their return or await site. Completion cannot protect earlier listeners or discarded promises. Invariant collection aliases reuse cached resolution while retaining their original depth checks; failed mutation/escape scans never publish partial facts. A failed startup analysis context retains its failure on retry, including after exhaustion during lazy result iteration.
+
 BOM-marked UTF-16LE and UTF-16BE sources are decoded for auditing; UTF-8 (including BOM) remains supported. File limits still apply to bytes read from the descriptor. UTF-16 automated patches are left for manual repair; `--fix` never rewrites them as UTF-8.
 
 For local troubleshooting, `--debug` writes original detector exceptions and stacks to stderr. JSON/Markdown/HTML reports retain sanitized errors; HTTP workers do not enable diagnostics. Debug output can contain private paths or source details, so inspect it before sharing. Analysis-limit failures expose typed, actionable reasons even without debugging.
@@ -206,10 +222,18 @@ DI analysis preserves conditional registration alternatives, ignores statically 
 
 Precision checks distinguish imported Node HTTP APIs from shadowed local names, require native timer-signal identity for timeout proof, and avoid concurrency warnings for proven synchronous projections. Destructured results count as dependencies between awaited calls. SQL percentage caps and branch-local caps cannot establish a bound for an entire result set. These checks remain static heuristics, not execution or full framework/SQL semantic analysis.
 
-### 0.3.7 — remaining limits
+### 0.3.8 — remaining limits
+
+Startup completion through native promise combinators such as `Promise.resolve(install())` remains conservative and can produce a missing-setup warning even when the wrapper is awaited.
+
+Startup method identity requires a receiver with no visible mutation or escape. Exported or escaped receivers, accessors, spreads, and methods using `this` remain conservative when proving helper execution or async return values.
+
+Class prototype mutations follow visible constructor and prototype aliases, including known instance constructor paths. Caught import rejection preserves independently reached parent setup; failed helper completions retain their own import prerequisites, and pending imports cannot resume through a catch.
+
+Awaited dynamic-import cycles cannot establish completed setup; ordinary static cycles and dependencies that have already completed remain supported. Visible throws from local CommonJS dependencies stop subsequent helper setup while preserving reached prefixes. CommonJS paths available only through runtime helper arguments remain conservative when dependency ordering cannot be established.
 
 Async property initializers are checked by declaration identity and visible writes in the declaration source. Property mutations in other files require manual review. Subclass overrides of an inherited method's `this` property are not resolved by runtime instance type, so this pattern can still produce a false positive and needs manual review.
 
 Concurrency checks inspect executed callback work, including calls whose results are discarded. Known synchronous built-ins and inspectable synchronous helpers can stay quiet; unknown external calls and overridable untyped methods such as `x.toString()` remain conservative candidates. Primitive receiver annotations are static evidence, not runtime validation.
 
-Deferred operational changes: the 20 MB aggregate source cap remains fatal before workspace analysis; it does not produce a partial report. Any skipped source file still marks an audit incomplete and returns CLI exit 3 by default, including in the GitHub Action. These strict behaviors are unchanged in 0.3.7. SQL bounds remain conservative; an outer query reading only a bounded CTE may still be reported as unbounded.
+Deferred operational changes: the 20 MB aggregate source cap remains fatal before workspace analysis; it does not produce a partial report. Any skipped source file still marks an audit incomplete and returns CLI exit 3 by default, including in the GitHub Action. These strict behaviors are unchanged in 0.3.8. SQL bounds remain conservative; an outer query reading only a bounded CTE may still be reported as unbounded.
