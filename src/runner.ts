@@ -17,7 +17,7 @@ import { detectReliability } from "./detectors/reliability.js";
 import type { Fingerprint, Finding, Report, DetectorStatus } from "./types.js";
 import { Workspace } from "./workspace.js";
 import { planCodemod, renderDiff, applyPlan } from "./codemod.js";
-import { scoreFindings, type AuditOptions } from "./scoring.js";
+import { scoreFindings, interpretScore, type AuditOptions } from "./scoring.js";
 import { assertSupportedNode } from "./runtime.js";
 
 // Read our installed package metadata, never the audited project's code.
@@ -116,6 +116,7 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
       fingerprint,
       findings,
       score,
+      scoreInterpretation: interpretScore(findings, complete),
       firstBottleneck,
       notes,
       summary: buildSummary(findings, categories),

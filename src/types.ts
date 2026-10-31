@@ -58,11 +58,24 @@ export interface CodemodSummary {
 
 export interface CategoryScore {
   category: string;
-  /** 0-100; 100 means nothing was found in this category. */
+  /** 0-100; 100 means no scored findings were detected in this category. */
   score: number;
   findings: number;
   penalty: number;
   weight: number;
+}
+
+/** Explain the score separately from coverage and runtime readiness. */
+export interface ScoreInterpretation {
+  model: "weighted-static-findings-v1";
+  meaning: string;
+  categoryMeaning: string;
+  calculation: string;
+  familyPenaltyCap: number;
+  subsequentFindingMultiplier: number;
+  bySeverity: Record<Severity, number>;
+  highPriorityFindings: number;
+  reviewMessage: string;
 }
 
 export interface ReportSummary {
@@ -100,6 +113,8 @@ export interface Report {
   fingerprint: Fingerprint;
   findings: Finding[];
   score: number;
+  /** Optional so reports produced before score interpretation remain readable. */
+  scoreInterpretation?: ScoreInterpretation;
   firstBottleneck: Finding | null;
   notes: string[];
   summary?: ReportSummary;

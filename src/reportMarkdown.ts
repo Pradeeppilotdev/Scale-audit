@@ -1,10 +1,13 @@
 import type { Finding, Report } from "./types.js";
+import { interpretScore } from "./scoring.js";
 
 /** How many findings to list per category before collapsing into a count. */
 const MAX_PER_CATEGORY = 10;
 
 export function renderMarkdown(report: Report): string {
   const lines: string[] = [];
+  const interpretation = report.scoreInterpretation ?? interpretScore(report.findings, report.complete);
+  const severity = interpretation.bySeverity;
   lines.push(`# Scale-Readiness Report`);
   lines.push("");
   lines.push(`- Repo: \`${report.repo}\``);
@@ -22,6 +25,10 @@ export function renderMarkdown(report: Report): string {
   lines.push("");
   if (report.complete === false) lines.push("> **Incomplete audit.** Checks failed or source files were skipped. The score reflects successful checks only; it is not a clean bill of health.", "");
   lines.push(`**Scale score: ${report.score}/100**`);
+  lines.push("", interpretation.meaning);
+  lines.push("", `Findings by severity: **${severity.critical} critical · ${severity.high} high · ${severity.medium} medium · ${severity.low} low · ${severity.info} informational**.`);
+  lines.push("", interpretation.highPriorityFindings > 0
+    ? `> **High-priority review:** ${interpretation.reviewMessage}` : interpretation.reviewMessage);
   if (report.coverage) {
     const c = report.coverage;
     lines.push("", `Source coverage: ${c.analyzed}/${c.discovered} analyzed; ${c.skipped.length} skipped.`);
@@ -61,6 +68,8 @@ export function renderMarkdown(report: Report): string {
       lines.push(`| ${c.category} | ${c.score}/100 | ${c.findings} |`);
     }
   }
+
+  lines.push("", interpretation.categoryMeaning, "", interpretation.calculation);
 
   const top = report.findings.slice(0, 5);
   lines.push("");

@@ -1,7 +1,10 @@
 import type { Report } from "./types.js";
+import { interpretScore } from "./scoring.js";
 
 export function renderHtml(report: Report): string {
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const interpretation = report.scoreInterpretation ?? interpretScore(report.findings, report.complete);
+  const severity = interpretation.bySeverity;
   const shown = report.findings.slice(0, 100);
   const findings = shown
     .map(
@@ -41,6 +44,7 @@ export function renderHtml(report: Report): string {
   .muted { color:var(--muted); font-size:13px; word-break:break-all; }
   .score { font-size:44px; font-weight:700; margin:24px 0 4px; }
   .verdict { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin:16px 0 28px; }
+  .priority-review { border-left:4px solid #f0883e; }
   .finding { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--muted); border-radius:10px; padding:14px 16px; margin:12px 0; }
   .sev-critical { border-left-color:#f85149; } .sev-high { border-left-color:#f0883e; }
   .sev-medium { border-left-color:#d29922; } .sev-low { border-left-color:#3fb950; } .sev-info { border-left-color:#58a6ff; }
@@ -63,6 +67,9 @@ export function renderHtml(report: Report): string {
   ${report.analyzer ? `<p class="muted">Analyzer: ${esc(report.analyzer.name)}@${esc(report.analyzer.version)} · report schema ${report.schemaVersion ?? "unknown"}</p>` : ""}
   ${report.analysisScope ? `<p>${esc(report.analysisScope.purpose)}</p><ul>${report.analysisScope.limitations.map(text => `<li>${esc(text)}</li>`).join("")}</ul>` : ""}
   <div class="score">${report.score}/100</div>
+  <p>${esc(interpretation.meaning)}</p>
+  <p><b>Findings by severity: ${esc(String(severity.critical))} critical · ${esc(String(severity.high))} high · ${esc(String(severity.medium))} medium · ${esc(String(severity.low))} low · ${esc(String(severity.info))} informational.</b></p>
+  <div class="verdict${interpretation.highPriorityFindings > 0 ? " priority-review" : ""}">${interpretation.highPriorityFindings > 0 ? "<b>High-priority review</b><br/>" : ""}${esc(interpretation.reviewMessage)}</div>
   ${report.coverage ? `<p>Source coverage: ${report.coverage.analyzed}/${report.coverage.discovered} analyzed; ${report.coverage.skipped.length} skipped.</p>${report.coverage.skipped.length || report.coverage.analyzed === 0 ? "<p><b>Incomplete source coverage. This score applies only to analyzed files.</b></p>" : ""}<ul>${report.coverage.skipped.map((s) => `<li>Skipped ${esc(s.file)}: ${esc(s.reason)}</li>`).join("")}</ul>` : ""}
   <div class="muted">Scanned ${esc(report.scannedAt)} · ${report.fingerprint.sourceFileCount} source files · ${esc(report.fingerprint.framework ?? "unknown framework")}${report.fingerprint.projectType !== "unknown" ? ` · ${esc(report.fingerprint.projectType)}` : ""}</div>
   ${
@@ -76,6 +83,8 @@ export function renderHtml(report: Report): string {
       : ""
   }
   ${categories ? `<h2>Score by category</h2><table class="cats"><tr><th>Category</th><th>Score</th><th>Findings</th></tr>${categories}</table>` : ""}
+  <p class="muted">${esc(interpretation.categoryMeaning)}</p>
+  <p class="muted">${esc(interpretation.calculation)}</p>
   <h2>Findings (${report.findings.length})</h2>
   ${findings || "<p class='muted'>No findings.</p>"}
   ${report.findings.length > shown.length ? `<p class="muted">Showing the first ${shown.length} of ${report.findings.length} findings. Use the JSON output for the full list.</p>` : ""}

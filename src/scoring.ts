@@ -1,4 +1,4 @@
-import type { Finding } from "./types.js";
+import type { Finding, ScoreInterpretation, Severity } from "./types.js";
 
 const SEVERITY_WEIGHT: Record<Finding["severity"], number> = {
   critical: 20,
@@ -38,7 +38,7 @@ const DEFAULT_CATEGORY_WEIGHT = 1;
 
 export interface CategoryScore {
   category: string;
-  /** 0-100; 100 means nothing was found in this category. */
+  /** 0-100; 100 means no scored findings were detected in this category. */
   score: number;
   findings: number;
   /** Penalty points deducted from 100. */
@@ -114,6 +114,35 @@ export function familyPenalty(findings: Finding[]): number {
     factor *= DECAY;
   }
   return Math.min(penalty, FAMILY_PENALTY_CAP);
+}
+
+/** Presentation metadata only: this never changes scoring or CI thresholds. */
+export function interpretScore(findings: Finding[], complete?: boolean): ScoreInterpretation {
+  const bySeverity: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const finding of findings) bySeverity[finding.severity]++;
+  const highPriorityFindings = bySeverity.critical + bySeverity.high;
+  let reviewMessage: string;
+  if (highPriorityFindings) {
+    reviewMessage = `${highPriorityFindings} high-priority finding(s) (${bySeverity.critical} critical, ${bySeverity.high} high) require review regardless of the score.`;
+  } else if (bySeverity.medium + bySeverity.low) {
+    reviewMessage = `${bySeverity.medium + bySeverity.low} medium/low finding(s) remain for review. Runtime capacity and production readiness remain unverified.`;
+  } else if (bySeverity.info) {
+    reviewMessage = `${bySeverity.info} informational finding(s). No scored findings were detected; runtime capacity and production readiness remain unverified.`;
+  } else {
+    reviewMessage = "No findings were detected by the current checks. Runtime capacity and production readiness remain unverified.";
+  }
+  if (complete === false) reviewMessage = `Incomplete audit: some checks failed or source files were skipped. ${reviewMessage}`;
+  return {
+    model: "weighted-static-findings-v1",
+    meaning: "A weighted summary of detected static findings. Runtime capacity and production readiness remain unverified.",
+    categoryMeaning: "A category score of 100 means no scored findings were detected in that category. Categories with no findings may still contain unsupported or unresolved risks.",
+    calculation: "Category weights use a fixed nine-category baseline. Within each finding family, the worst finding has full weight and subsequent weights halve, capped at 20 penalty points per family. Low-confidence findings receive half weight. Repeated high-severity findings can coexist with a high overall score.",
+    familyPenaltyCap: FAMILY_PENALTY_CAP,
+    subsequentFindingMultiplier: DECAY,
+    bySeverity,
+    highPriorityFindings,
+    reviewMessage,
+  };
 }
 
 export interface AuditOptions {

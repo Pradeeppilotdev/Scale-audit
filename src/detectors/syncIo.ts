@@ -4,6 +4,7 @@ import ts from "typescript";
 import { lineOf, snippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
+import { requestReachability, type RequestReachability } from "../requestReachability.js";
 
 const SYNC_BLOCKING = new Set([
   "readFileSync",
@@ -34,6 +35,7 @@ export async function detectSyncIo(root: string, ws?: Workspace): Promise<Findin
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
   const contexts = await executionContexts(root, workspace, isRequestPath);
+  const requests = requestReachability(workspace);
   for (const unit of workspace.units) {
     const { rel, content, sf } = unit;
 
@@ -41,7 +43,7 @@ export async function detectSyncIo(root: string, ws?: Workspace): Promise<Findin
     const context = contexts.get(rel);
     const hotPath = context?.request ?? false;
 
-    visitSync(sf, sf, content, rel, out, hotPath, isScript, context);
+    visitSync(sf, sf, content, rel, out, hotPath, isScript, context, requests);
 
     if (IMAGE_LIBS.test(content) && hotPath) {
       const ln = findLine(content, IMAGE_LIBS);
@@ -66,7 +68,7 @@ export async function detectSyncIo(root: string, ws?: Workspace): Promise<Findin
   return out;
 }
 
-function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[], hotPath: boolean, isScript: boolean, context?: ExecutionContext) {
+function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[], hotPath: boolean, isScript: boolean, context?: ExecutionContext, requests?: RequestReachability) {
   if (ts.isCallExpression(node)) {
     let name =
       ts.isPropertyAccessExpression(node.expression) ? node.expression.name.getText() : ts.isIdentifier(node.expression) ? node.expression.text : "";
@@ -74,12 +76,14 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
     if (imported && /^(node:)?(fs(?:\/promises)?|child_process|crypto|zlib)$/.test(imported.module)) name = imported.name;
     if (SYNC_BLOCKING.has(name) || /(FileSync|DirSync)$/.test(name)) {
       const ln = lineOf(sf, node);
+      const request = requests?.evidence(node);
+      const reached = request === "request";
       const inFunction = isInsideFunction(node);
-      const startup = !inFunction && !isScript;
-      const isolated = !hotPath && (context?.cli || context?.worker);
+      const startup = !inFunction && !isScript && !reached;
+      const isolated = !hotPath && !request && (context?.cli || context?.worker);
       const label = context?.cli && context?.worker ? "CLI/isolated worker" : context?.worker ? "isolated worker" : "CLI";
-      const severity = isolated ? "info" : startup ? "low" : hotPath ? "high" : isScript ? "low" : "medium";
-      const confidence = isolated ? "medium" : startup ? "low" : hotPath ? "medium" : "low";
+      const severity = isolated ? "info" : startup ? "low" : reached ? "high" : isScript ? "low" : "medium";
+      const confidence = isolated ? "medium" : startup ? "low" : reached ? "medium" : "low";
       const message = isolated
         ? `Synchronous call "${name}" runs in ${label} code (based on module reachability).`
         : startup
@@ -87,8 +91,12 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
         : `Synchronous call "${name}" blocks the event loop.`;
       const scaleTrigger = isolated
         ? "Blocks this CLI/worker execution; no request-entry import path was found in the analyzed source. Slow storage can still delay the audit."
-        : hotPath && !startup
-          ? "This module is reachable from a request entry; synchronous I/O can stall concurrent requests."
+        : reached && !startup
+          ? "This call is reachable from a request entry through a request callback or invoked helper; synchronous I/O can stall concurrent requests."
+          : request === "possible"
+          ? "This callback may execute as work originating from a request; external callback invocation could not be resolved."
+          : hotPath && !startup
+          ? "No function-level request call path was established. Importing this module alone does not show that this synchronous call executes per request."
           : isScript
         ? "Script sync call; not a runtime bottleneck unless run in a request path."
         : startup
@@ -115,7 +123,7 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
       );
     }
   }
-  ts.forEachChild(node, (c) => visitSync(c, sf, content, rel, out, hotPath, isScript, context));
+  ts.forEachChild(node, (c) => visitSync(c, sf, content, rel, out, hotPath, isScript, context, requests));
 }
 
 function isInsideFunction(node: ts.Node): boolean {
@@ -128,7 +136,8 @@ function isInsideFunction(node: ts.Node): boolean {
       ts.isMethodDeclaration(cur) ||
       ts.isGetAccessorDeclaration(cur) ||
       ts.isSetAccessorDeclaration(cur) ||
-      ts.isConstructorDeclaration(cur)
+      ts.isConstructorDeclaration(cur) ||
+      ts.isPropertyDeclaration(cur) && !cur.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword)
     ) {
       return true;
     }

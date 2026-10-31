@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const http = require("node:http");
 
 function loadMany() {
   const a = fs.readFileSync("./a.json", "utf8");
@@ -17,3 +18,5 @@ function loadMany() {
 }
 
 module.exports = { loadMany };
+
+http.createServer((_req, res) => res.end(JSON.stringify(loadMany())));

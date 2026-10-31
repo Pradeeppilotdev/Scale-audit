@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {detectSyncIo} from '../dist/detectors/syncIo.js';
+async function rows(t,body){const root=await mkdtemp('/tmp/scale-nested-default-payload-');t.after(()=>rm(root,{recursive:true,force:true}));await writeFile(root+'/main.ts',`import http from 'node:http';import fs from 'node:fs';${body}`);return(await detectSyncIo(root)).filter(row=>row.id==='sync-io')}
+async function high(t,body){return(await rows(t,body)).filter(row=>row.severity==='high')}
+for(const value of ['[[0]]','[[false]]','[[undefined]]','[[]]'])test('nested array payload remains truthy: '+value,async t=>{assert.equal((await high(t,`http.createServer(()=>${value}.forEach(x=>{if(x)fs.readFileSync('live')}));`)).length,1)});
+for(const value of ['[[undefined]]','[[]]'])test('nested array payload prevents callback default: '+value,async t=>{assert.equal((await high(t,`http.createServer(()=>${value}.forEach((x=fs.readFileSync('dead'))=>x));`)).length,0)});
+test('nested array payload retains helper collection provenance',async t=>{assert.equal((await high(t,`function each(items){items.forEach(()=>fs.readFileSync('live'))}http.createServer(()=>[[1]].forEach(each));`)).length,1)});
+test('nested empty array payload excludes helper callback',async t=>{assert.equal((await high(t,`function each(items){items.forEach(()=>fs.readFileSync('dead'))}http.createServer(()=>[[]].forEach(each));`)).length,0)});
+for(const initialization of ['true',"'yes'",'[]','{}'])test('undefined is replaced by direct default: '+initialization,async t=>{assert.equal((await high(t,`function run(x=${initialization}){if(x)return;fs.readFileSync('dead')}http.createServer(()=>run(undefined));`)).length,0)});
+for(const initialization of ['true',"'yes'",'[]'])test('undefined is replaced by callback default: '+initialization,async t=>{assert.equal((await high(t,`http.createServer(()=>[undefined].forEach((x=${initialization})=>{if(x)return;fs.readFileSync('dead')}));`)).length,0)});
+test('defined alternatives remain alongside the selected default',async t=>{assert.equal((await high(t,`http.createServer(()=>[undefined,0].forEach((x=true)=>{if(x)return;fs.readFileSync('live')}));`)).length,1)});
+test('replaced undefined does not hide a live false default',async t=>{assert.equal((await high(t,`http.createServer(()=>[undefined].forEach((x=false)=>{if(x)return;fs.readFileSync('live')}));`)).length,1)});
+test('Array.from densifies representative holes before later callbacks',async t=>{assert.equal((await high(t,`http.createServer(()=>Array.from(new Array(3)).forEach((x=fs.readFileSync('live'))=>x));`)).length,1)});
+test('Array.from keeps nested array payload values intact',async t=>{assert.equal((await high(t,`http.createServer(()=>Array.from([[undefined]]).forEach((x=fs.readFileSync('dead'))=>x));`)).length,0)});
+test('empty mapped Array.from still excludes later callbacks',async t=>{assert.equal((await high(t,`http.createServer(()=>Array.from([],()=>1).forEach(()=>fs.readFileSync('dead')));`)).length,0)});
+for(const expression of ['Array.from({length:0},read)','Array.from({length:0}).forEach(read)'])test('inherited iterator mutation invalidates empty array-like proof: '+expression,async t=>{const result=await rows(t,`Object.prototype[Symbol.iterator]=function*(){yield 1};function read(){fs.readFileSync('live')}http.createServer(()=>${expression});`);assert.equal(result.length,1);assert.ok(result[0].severity==='high'||/could not be resolved/.test(result[0].scaleTrigger));});
+test('unchanged zero-length array-like object still excludes callback',async t=>{assert.equal((await high(t,`function read(){fs.readFileSync('dead')}http.createServer(()=>Array.from({length:0},read));`)).length,0)});
+test('promise array payload is supplied rather than its undefined element',async t=>{assert.equal((await high(t,`http.createServer(()=>Promise.reject([undefined]).catch((x=fs.readFileSync('dead'))=>x));`)).length,0)});
