@@ -185,6 +185,19 @@ test("raw SQL is manual regardless of dialect, templates, comments or statement 
   }
 });
 
+test("a mixed-name SQL tag cannot direct a pagination edit to another call on the same line", async t => {
+  const { runAudit } = await import("../dist/runner.js");
+  const tag = 'prisma.$queryRaw`WITH "page" AS (SELECT id FROM events LIMIT 2) SELECT * FROM page`';
+  for (const line of [tag + "; helpers.findMany();", "helpers.findMany(); " + tag + ";", tag + ".findMany();"]) {
+    const { root, full } = repo(t, line + "\n");
+    const report = await runAudit(root, { codemod: "diff" });
+    assert.equal(report.complete, true);
+    assert.ok(report.findings.some(f => f.id === "unbounded-read" && f.confidence === "low"));
+    assert.deepEqual(report.codemod.edits, []);
+    assert.equal(fs.readFileSync(full, "utf8"), line + "\n");
+  }
+});
+
 test("repeated findings cannot create duplicate positional insertions", (t) => {
   const { root } = repo(t, fetchSource);
   const f = finding("outbound-no-timeout");

@@ -167,9 +167,10 @@ A linter that cries wolf gets uninstalled, so every finding is grounded in evide
 - Query-builder methods (`select`, `from`, `where`) are not reads on their own; only the completed chain is.
 - GraphQL/SDK clients (`client.query({ query })`) are not mistaken for raw SQL.
 - Locally shadowed `fetch`/`axios` bindings and Axios utility exports are excluded from HTTP findings and timeout fixes; supported ESM/CommonJS import aliases retain their identity. Native `globalThis.fetch` and `undici.fetch` are also recognized.
-- Raw SQL checks evaluate each statement separately, skip comments and quoted values when matching keywords, and distinguish scalar aggregates and non-returning writes from row reads. A direct column projection from a capped, nonrecursive common table expression inherits its row bound. Joins and projections that can expand rows still need their own bound. Mixing quoted and unquoted references to a table expression can produce a conservative warning.
+- Raw SQL checks evaluate each statement separately, skip comments and string values when matching keywords, and distinguish scalar aggregates and non-returning writes from row reads. A direct column projection from a capped, nonrecursive common table expression (CTE) inherits its row bound. Joins and projections that can expand rows still need their own bound.
 - Missing-index checks follow logical groups, scalar operators and direct `null` comparisons on nullable scalar fields. N+1 checks follow reads in resolved collection callbacks and reads collected in a loop for a later `Promise.all` or `Promise.allSettled`. Call-site findings carry a one-based column so independent calls on one line retain their severity and score.
-- Raw SQL checks recognize imported PostgreSQL pools and clients under local names. A projection of multiple ungrouped scalar aggregates has bounded result cardinality. Grouped and windowed results can grow with the data.
+- For mixed quoted and unquoted CTE names, the audit uses PostgreSQL name rules for `pg` pools and clients, and SQLite name rules for `@libsql/client`. It also recognizes a literal PostgreSQL or SQLite client setting in Knex. If the driver is unknown and the possible name resolutions disagree about the cap, the audit emits a medium-severity, low-confidence finding for review.
+- A projection of multiple ungrouped scalar aggregates has bounded result cardinality. Grouped and windowed results can grow with the data.
 - Bare rejected promises and ineffective `.catch()` handlers are reported.
 - Findings carry `confidence`; ambiguous cases (query or config passed as a variable) are reported as `low` instead of asserted.
 - A request path is matched on whole path segments, so `capitalize.ts` is not treated as an API route.
@@ -245,6 +246,10 @@ Cross-file binding-depth exhaustion marks affected detectors incomplete; genuine
 DI analysis preserves conditional registration alternatives, ignores statically dead branches, and follows inherited Nest injection metadata. Scope aliases use visible assignment and capture timing; ambiguous writes and mutable conditions cannot prove singleton reuse. TSyringe constructor-type inference requires an analyzed config with `emitDecoratorMetadata: true`; missing or disabled metadata is uncertain, while explicit injection tokens are still followed.
 
 Precision checks distinguish imported Node HTTP APIs from shadowed local names, require native timer-signal identity for timeout proof, and avoid concurrency warnings for proven synchronous projections. Destructured results count as dependencies between awaited calls. SQL percentage caps and branch-local caps cannot establish a bound for an entire result set. These checks remain static heuristics, not execution or full framework/SQL semantic analysis.
+
+### In 0.4.1
+
+A capped PostgreSQL CTE declared as `"page"` and read as `page` now passes `--fail-on high` when the rest of the query preserves its row bound. The audit still flags an uncapped read from a separate table. SQLite queries use SQLite's identifier rules.
 
 ### In 0.4.0
 

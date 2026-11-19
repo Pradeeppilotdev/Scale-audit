@@ -390,9 +390,9 @@ function callsByLine(sf: ts.SourceFile): CallIndex {
   const pending: ts.Node[] = [sf];
   while (pending.length) {
     const node = pending.pop()!;
-    if (ts.isCallExpression(node)) {
+    if (ts.isCallExpression(node) || ts.isTaggedTemplateExpression(node)) {
       const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
-      calls.set(line, calls.has(line) ? null : node);
+      calls.set(line, ts.isCallExpression(node) && !calls.has(line) ? node : null);
     }
     ts.forEachChild(node, child => { pending.push(child); });
   }
@@ -400,9 +400,8 @@ function callsByLine(sf: ts.SourceFile): CallIndex {
 }
 
 function findCallAtLine(calls: CallIndex, line: number, predicate: (call: ts.CallExpression) => boolean): ts.CallExpression | null {
-  // Include unsupported calls: the line-only finding could refer to one of
-  // those rather than the call we know how to patch. Helper calls on the same
-  // line are conservatively manual too, until findings carry exact offsets.
+  // A tagged SQL template or another call on the same line can own the finding.
+  // Only one unambiguous call can receive a generated edit.
   const call = calls.get(line);
   return call && predicate(call) ? call : null;
 }

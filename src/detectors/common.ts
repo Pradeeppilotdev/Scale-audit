@@ -3,8 +3,9 @@ import ts from "typescript";
 import type { Finding } from "../types.js";
 import type { FileContext } from "../context.js";
 import { lastSegment } from "../context.js";
-import { bindingWriteIndex, currentImportedBinding, currentInitializer, symbolOf } from "../bindings.js";
-import { staticExpression } from "../staticValues.js";
+import { bindingWriteIndex, currentImportedBinding, currentInitializer, projectFor, symbolOf } from "../bindings.js";
+import { staticExpression, staticProperties } from "../staticValues.js";
+import type { AnalysisBudget } from "../analysisBudget.js";
 
 export async function listSourceFiles(root: string): Promise<string[]> {
   const ignoredDirs = new Set([
@@ -136,20 +137,196 @@ export const DB_WRITE_RECEIVER = /(^|\.)(prisma|db|database|redis|redisClient|kn
  */
 const NON_DATA_RECEIVER = /(Service|Controller|Resolver|Helper|Helpers|Util|Utils|Factory|Builder|Validator|Mapper|Serializer|Presenter|Formatter|Provider|Handler|Middleware|Guard|Strategy|Pipeline)$/;
 
-const postgresAllocations = new WeakMap<ts.Node, boolean>();
+const sqlAllocations = new WeakMap<ts.Node, ts.Node | null>();
+
+function sqlAllocation(receiver: ts.Expression): ts.Node | undefined {
+  const declaration = ts.isIdentifier(receiver) ? symbolOf(receiver)?.valueDeclaration : undefined;
+  const captured = declaration && ts.isVariableDeclaration(declaration) ? currentInitializer(declaration, receiver) : receiver;
+  if (!captured) return undefined;
+  const known = sqlAllocations.get(captured);
+  if (known !== undefined) return known ?? undefined;
+  const value = staticExpression(captured, new Set(), bindingWriteIndex(captured.getSourceFile()).budget);
+  sqlAllocations.set(captured, value ?? null);
+  return value;
+}
+
+type SqlIdentifierDialect = "postgres" | "sqlite";
+type SqlFactory = "Pool" | "Client" | "libsql" | "knex";
+const knexDialects = new WeakMap<ts.CallExpression, SqlIdentifierDialect | null>();
+
+function pgConstructor(expression: ts.Expression): "Pool" | "Client" | undefined {
+  const imported = currentImportedBinding(expression);
+  return imported?.module === "pg" && (imported.name === "Pool" || imported.name === "Client") ? imported.name : undefined;
+}
+
+function sqlFactory(value: ts.Node | undefined): SqlFactory | undefined {
+  if (!value) return;
+  if (ts.isNewExpression(value)) return pgConstructor(value.expression);
+  if (!ts.isCallExpression(value)) return;
+  const factory = currentImportedBinding(value.expression);
+  if (factory?.module === "@libsql/client" && factory.name === "createClient") return "libsql";
+  if (factory?.module === "knex" && ["default", "knex", "*"].includes(factory.name)) return "knex";
+}
 
 /** A Pool or Client remains a database receiver under application-specific names. */
 export function isPostgresClient(receiver: ts.Expression): boolean {
-  const declaration = ts.isIdentifier(receiver) ? symbolOf(receiver)?.valueDeclaration : undefined;
-  const captured = declaration && ts.isVariableDeclaration(declaration) ? currentInitializer(declaration, receiver) : receiver;
-  if (!captured) return false;
-  const known = postgresAllocations.get(captured);
-  if (known !== undefined) return known;
-  const value = staticExpression(captured, new Set(), bindingWriteIndex(captured.getSourceFile()).budget);
-  const imported = value && ts.isNewExpression(value) ? currentImportedBinding(value.expression) : null;
-  const postgres = imported?.module === "pg" && (imported.name === "Pool" || imported.name === "Client");
-  postgresAllocations.set(captured, postgres);
-  return postgres;
+  const value = sqlAllocation(receiver);
+  return !!value && ts.isNewExpression(value) && !!pgConstructor(value.expression);
+}
+
+export function isLibsqlClient(receiver: ts.Expression): boolean {
+  return sqlFactory(sqlAllocation(receiver)) === "libsql";
+}
+
+// A per-project index keeps a method patched through one alias from acquiring
+// driver evidence through another. A direct top-level write only affects later
+// top-level calls; functions can be invoked after the patch.
+type SqlWrites = Map<ts.Node | SqlFactory, Map<string, ts.Statement | null>>;
+const sqlMethodWrites = new WeakMap<object, SqlWrites>();
+const writeReceivers = new WeakMap<ts.Node, ts.Node | null>();
+const writeReceiverFields = new WeakMap<ts.ObjectLiteralExpression | ts.ArrayLiteralExpression, Map<string, ts.Node>>();
+
+function sqlMember(value: ts.PropertyAccessExpression | ts.ElementAccessExpression): string | undefined {
+  if (ts.isPropertyAccessExpression(value)) return value.name.text;
+  return ts.isStringLiteralLike(value.argumentExpression) || ts.isNumericLiteral(value.argumentExpression) ? value.argumentExpression.text : undefined;
+}
+
+// Follow stored clients for invalidation only. The write index records later
+// values assigned into properties as escapes as well. A container cannot
+// supply positive evidence about which driver executes a query.
+function writeReceiver(target: ts.Expression, budget: AnalysisBudget): ts.Node | undefined {
+  let value = sqlAllocation(target);
+  const seen = new Set<ts.Node>();
+  while (value && (ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value))) {
+    budget.take();
+    if (writeReceivers.has(value)) { value = writeReceivers.get(value) ?? undefined; break; }
+    if (seen.has(value)) { value = undefined; break; }
+    seen.add(value);
+    const decl = symbolOf(ts.isPropertyAccessExpression(value) ? value : value.argumentExpression)?.valueDeclaration;
+    let field = decl && (ts.isPropertyAssignment(decl) ? decl.initializer : ts.isShorthandPropertyAssignment(decl) ? decl.name : undefined);
+    if (!field) {
+      const member = sqlMember(value), object = sqlAllocation(value.expression);
+      if (member === undefined || !object || !(ts.isObjectLiteralExpression(object) || ts.isArrayLiteralExpression(object))) break;
+      let fields = writeReceiverFields.get(object);
+      if (!fields) {
+        fields = ts.isObjectLiteralExpression(object) ? staticProperties(object, budget) : new Map<string, ts.Node>();
+        if (ts.isArrayLiteralExpression(object)) for (const [i, entry] of object.elements.entries()) {
+          budget.take();
+          if (ts.isSpreadElement(entry)) break;
+          fields.set(String(i), entry);
+        }
+        writeReceiverFields.set(object, fields);
+      }
+      const stored = fields.get(member);
+      if (stored && ts.isExpression(stored) && stored.pos >= 0) field = stored;
+    }
+    if (!field) break;
+    value = sqlAllocation(field);
+  }
+  for (const visited of seen) { budget.take(); writeReceivers.set(visited, value ?? null); }
+  return value;
+}
+
+function sqlWriteTarget(target: ts.Expression, budget: AnalysisBudget): ts.Node | SqlFactory | undefined {
+  const value = writeReceiver(target, budget);
+  if (!value) return;
+  if (ts.isCallExpression(value) && value.arguments[0]) {
+    const callee = sqlAllocation(value.expression);
+    if (callee && (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee))
+      && sqlMember(callee) === "getPrototypeOf" && ts.isIdentifier(callee.expression)
+      && (callee.expression.text === "Object" || callee.expression.text === "Reflect") && !symbolOf(callee.expression)) {
+      return sqlFactory(writeReceiver(value.arguments[0], budget));
+    }
+  }
+  if (ts.isNewExpression(value) || ts.isCallExpression(value)) return value;
+  if (!(ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value))) return;
+  const name = sqlMember(value);
+  if (name === "__proto__") return sqlFactory(writeReceiver(value.expression, budget));
+  if (name !== "prototype") return;
+  const imported = pgConstructor(value.expression);
+  if (imported) return imported;
+  const ctor = writeReceiver(value.expression, budget);
+  if (ctor && (ts.isPropertyAccessExpression(ctor) || ts.isElementAccessExpression(ctor)) && sqlMember(ctor) === "constructor") {
+    return sqlFactory(writeReceiver(ctor.expression, budget));
+  }
+}
+
+function writesForSqlClients(sf: ts.SourceFile): SqlWrites {
+  const project = projectFor(sf), scope = project ?? sf, cached = sqlMethodWrites.get(scope);
+  if (cached) return cached;
+  const writes: SqlWrites = new Map();
+  for (const file of project?.sources.values() ?? [sf]) {
+    const index = bindingWriteIndex(file);
+    for (const { node, receiver: target, name } of index.nativeWrites) {
+      index.budget.take();
+      if (!target || (name !== undefined && name !== "query" && name !== "execute" && name !== "raw")) continue;
+      // These capture a value. The write to the stored member is indexed at its own site.
+      if (ts.isReturnStatement(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)
+        || ts.isShorthandPropertyAssignment(node) || ts.isArrayLiteralExpression(node)) continue;
+      if (ts.isLiteralExpression(target) || ts.isObjectLiteralExpression(target) || ts.isArrayLiteralExpression(target)) continue;
+      const value = sqlWriteTarget(target, index.budget);
+      if (!value) continue;
+      const methods = writes.get(value) ?? new Map<string, ts.Statement | null>();
+      const member = name ?? "*";
+      const statement = ts.isExpressionStatement(node.parent) && node.parent.parent === file ? node.parent : null;
+      const first = methods.get(member);
+      if (first === undefined) methods.set(member, statement);
+      else if (first && (!statement || first.getSourceFile() !== file || statement.pos < first.pos)) {
+        methods.set(member, statement && first.getSourceFile() === file ? statement : null);
+      }
+      writes.set(value, methods);
+    }
+  }
+  sqlMethodWrites.set(scope, writes);
+  return writes;
+}
+
+function hasSqlMethodWrite(receiver: ts.Expression, method: string, allocation: ts.Node, factory: SqlFactory): boolean {
+  const sf = receiver.getSourceFile(), writes = writesForSqlClients(sf);
+  for (const key of [allocation, factory]) for (const member of [method, "*"]) {
+    const write = writes.get(key)?.get(member);
+    if (write === undefined) continue;
+    if (!write || write.getSourceFile() !== sf || write.pos <= receiver.pos ||
+        ts.findAncestor(receiver, node => ts.isFunctionLike(node) || ts.isClassLike(node))) return true;
+  }
+  return false;
+}
+
+function knexIdentifierDialect(factory: ts.CallExpression): SqlIdentifierDialect | undefined {
+  const cached = knexDialects.get(factory);
+  if (cached !== undefined) return cached ?? undefined;
+  const options = factory.arguments[0] && asObjectLiteral(factory.arguments[0]);
+  let dialect: SqlIdentifierDialect | undefined;
+  if (options) {
+    const budget = bindingWriteIndex(factory.getSourceFile()).budget;
+    // Knex reads the final client option. A later spread or computed key may replace it.
+    for (let i = options.properties.length - 1; i >= 0; i--) {
+      budget.take();
+      const prop = options.properties[i];
+      if (ts.isSpreadAssignment(prop) || ts.isComputedPropertyName(prop.name)) break;
+      if (!(ts.isIdentifier(prop.name) || ts.isStringLiteralLike(prop.name)) || prop.name.text !== "client") continue;
+      if (ts.isPropertyAssignment(prop) && ts.isStringLiteralLike(prop.initializer)) {
+        switch (prop.initializer.text) {
+          case "pg": case "postgres": case "postgresql": dialect = "postgres"; break;
+          case "sqlite3": case "better-sqlite3": dialect = "sqlite"; break;
+        }
+      }
+      break;
+    }
+  }
+  knexDialects.set(factory, dialect ?? null);
+  return dialect;
+}
+
+/** Attribute identifier folding to the client that receives this particular query. */
+export function sqlIdentifierDialect(receiver: ts.Expression, method: string): SqlIdentifierDialect | undefined {
+  const value = sqlAllocation(receiver), factory = sqlFactory(value);
+  if (!value || !factory) return;
+  let dialect: SqlIdentifierDialect | undefined;
+  if (method === "query" && (factory === "Pool" || factory === "Client")) dialect = "postgres";
+  else if (method === "execute" && factory === "libsql") dialect = "sqlite";
+  else if (method === "raw" && factory === "knex" && ts.isCallExpression(value)) dialect = knexIdentifierDialect(value);
+  return dialect && !hasSqlMethodWrite(receiver, method, value, factory) ? dialect : undefined;
 }
 
 /**
