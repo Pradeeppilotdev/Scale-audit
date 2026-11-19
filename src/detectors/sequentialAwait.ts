@@ -1,6 +1,6 @@
 import { isHttpFetch } from "../bindings.js";
 import ts from "typescript";
-import { lineOf, snippetAt, makeFinding, DB_RECEIVER } from "./common.js";
+import { locationOf, sourceSnippetAt, makeFinding, DB_RECEIVER } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
 
@@ -18,8 +18,8 @@ import { Workspace } from "../workspace.js";
 export async function detectSequentialAwaits(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
   const workspace = ws ?? (await Workspace.load(root));
-  for (const { rel, content, sf } of workspace.units) {
-    visit(sf, sf, content, rel, out);
+  for (const { rel, sf } of workspace.units) {
+    visit(sf, sf, rel, out);
   }
   return out;
 }
@@ -27,7 +27,7 @@ export async function detectSequentialAwaits(root: string, ws?: Workspace): Prom
 /** Calls whose ordering is meaningful and must not be parallelised. */
 const ORDERED_CALLS = /^(commit|rollback|begin|transaction|releaseLock|acquireLock|lock|unlock|selectForUpdate|tx)$/i;
 
-function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[]): void {
+function visit(node: ts.Node, sf: ts.SourceFile, rel: string, out: Finding[]): void {
   if (ts.isBlock(node)) {
     const stmts = node.statements;
     for (let i = 0; i < stmts.length - 1; i++) {
@@ -40,7 +40,7 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, o
       // `await`s on in-memory work is not a scale problem.
       if (!isNetworkOrDbCall(a) || !isNetworkOrDbCall(b)) continue;
 
-      const ln = lineOf(sf, stmts[i]);
+      const { line, column } = locationOf(sf, stmts[i]);
       out.push(
         makeFinding({
           id: "sequential-awaits",
@@ -48,16 +48,16 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, o
           severity: "low",
           confidence: "low",
           file: rel,
-          line: ln,
+          line, column,
           message: "Two independent calls are awaited one after the other; they can run concurrently.",
           scaleTrigger: "Latency is the sum of both calls instead of the max, and it compounds on every request.",
           suggestedFix: "Run them together with `await Promise.all([a, b])` if the ordering is not intentional.",
-          snippet: snippetAt(content, ln),
+          snippet: sourceSnippetAt(sf, line),
         }),
       );
     }
   }
-  ts.forEachChild(node, (c) => visit(c, sf, content, rel, out));
+  ts.forEachChild(node, (c) => visit(c, sf, rel, out));
 }
 
 /**

@@ -10,6 +10,9 @@ import { projectWorkLimit, AnalysisBudget, AnalysisLimitError } from '../dist/an
 import { renderMarkdown } from '../dist/reportMarkdown.js';
 import { renderHtml } from '../dist/reportHtml.js';
 import { createAuditProcessRunner } from '../dist/auditProcess.js';
+import { requestReachability } from '../dist/requestReachability.js';
+import { Workspace } from '../dist/workspace.js';
+import { detectQueueBackpressure } from '../dist/detectors/queueBackpressure.js';
 
 async function fixture(fn) {
   const root = await mkdtemp(path.join(tmpdir(), 'scale-completeness-'));
@@ -25,6 +28,111 @@ test('whole-project limits scale with AST size, retain a floor and a ceiling', (
   assert.ok(projectWorkLimit([source]) > 200000);
   assert.equal(projectWorkLimit(Array(20001).fill(source)), 20000000);
 });
+
+test('detectors share successful request reachability only within the same workspace', async () => fixture(async root => {
+  await writeFile(path.join(root, 'route.ts'), 'export function GET() {}');
+  const first = await Workspace.load(root);
+  const second = await Workspace.load(root);
+  assert.strictEqual(requestReachability(first), requestReachability(first));
+  assert.notStrictEqual(requestReachability(first), requestReachability(second));
+}));
+
+test('complete audit scores queue backpressure under Concurrency', async () => fixture(async root => {
+  await writeFile(path.join(root, 'server.ts'), `
+    import { createServer } from 'node:http';
+    const jobs: string[] = [];
+    function work(job: string | undefined) { console.log(job); }
+    createServer(req => jobs.push(req.url ?? '/'));
+    setInterval(() => work(jobs.shift()), 100);
+  `);
+  const report = await runAudit(root);
+  assert.equal(report.complete, true);
+  assert.ok(report.detectors.some(d => d.name === 'detectQueueBackpressure' && d.status === 'complete'));
+  const finding = report.findings.find(f => f.id === 'unbounded-request-queue');
+  assert.equal(finding?.category, 'Concurrency');
+  assert.equal(finding.severity, 'medium');
+  assert.ok(report.score < 100);
+}));
+
+test('complete audit reports a request-sized batch after a single queue admission check', async () => fixture(async root => {
+  await writeFile(path.join(root, 'server.ts'), `
+    import { createServer } from 'node:http';
+    const jobs: number[] = [];
+    let outstanding = 0;
+    function enqueue(job: number) { jobs.push(job); outstanding++; }
+    function work(job: number | undefined) { if (job !== undefined) outstanding--; }
+    createServer(req => {
+      if (outstanding >= 10) return;
+      Array.from({ length: Number(req.url?.slice(1)) }, (_, index) => enqueue(index));
+    });
+    setInterval(() => work(jobs.shift()), 100);
+  `);
+  const report = await runAudit(root);
+  assert.equal(report.complete, true);
+  const findings = report.findings.filter(finding => finding.id === 'unbounded-request-queue');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].severity, 'medium');
+}));
+
+test('queue and sync I/O detectors share deterministic request budget exhaustion', async () => fixture(async root => {
+  const width = 600;
+  function choices(first, last, value) {
+    if (last - first === 1) return value(first);
+    const middle = (first + last) >> 1;
+    return `(unknown ? ${choices(first, middle, value)} : ${choices(middle, last, value)})`;
+  }
+  await writeFile(path.join(root, 'server.ts'), `
+    import { createServer } from 'node:http';
+    const jobs = [];
+    function work(job) {}
+    createServer(() => jobs.push(1));
+    setInterval(() => work(jobs.shift()), 100);
+    ${Array.from({ length: width }, (_, i) => `function f${i}(arg = 0) {}`).join('\n')}
+    const target = ${choices(0, width, i => `f${i}`)};
+    const argument = ${choices(0, width, i => i === 0 ? 'undefined' : String(i))};
+    createServer(() => target(argument));
+  `);
+  const budgets = new Set();
+  const take = AnalysisBudget.prototype.take;
+  AnalysisBudget.prototype.take = function(count) {
+    if (this.label === 'Request reachability') budgets.add(this);
+    return take.call(this, count);
+  };
+  let report;
+  try { report = await runAudit(root); } finally { AnalysisBudget.prototype.take = take; }
+  assert.equal(budgets.size, 1);
+  assert.equal(report.complete, false);
+  for (const name of ['detectSyncIo', 'detectQueueBackpressure']) {
+    assert.deepEqual(report.detectors.find(detector => detector.name === name), {
+      name, status: 'failed', reason: 'Request reachability analysis work budget exceeded',
+    });
+  }
+}));
+
+test('many queue findings reuse line offsets instead of splitting the source per finding', async () => fixture(async root => {
+  const count = 1_000;
+  const source = `import { createServer } from 'node:http';
+function work(job) {}
+${Array.from({ length: count }, (_, i) => `const q${i} = [];
+createServer(() => q${i}.push(1));
+setInterval(() => work(q${i}.shift()), 100);`).join('\n')}`;
+  await writeFile(path.join(root, 'server.ts'), source);
+  const workspace = await Workspace.load(root);
+  requestReachability(workspace);
+  const split = String.prototype.split;
+  let measuredSplits = 0;
+  String.prototype.split = function(separator, limit) {
+    if (separator === '\n' && this.valueOf() === source) measuredSplits++;
+    return split.call(this, separator, limit);
+  };
+  let findings;
+  try { findings = await detectQueueBackpressure(root, workspace); }
+  finally { String.prototype.split = split; }
+  assert.equal(findings.length, count);
+  assert.equal(measuredSplits, 0);
+  assert.match(findings[0].snippet, /q0\.push\(1\)/);
+  assert.match(findings.at(-1).snippet, /q999\.push\(1\)/);
+}));
 
 test('320-file DI repository exceeds old budget and completes with known findings', async () => fixture(async root => {
   await Promise.all(Array.from({length:320}, (_,i) => writeFile(path.join(root, `module${i}.ts`), `
@@ -54,7 +162,8 @@ test('failed detector retains other findings and warns in JSON, Markdown and HTM
   await writeFile(path.join(root,'route.ts'),exhausted);
   const report=await runAudit(root);
   assert.equal(report.complete,false);
-  assert.equal(report.detectors.length,12);
+  assert.equal(report.detectors.length,13);
+  assert.ok(report.detectors.some(d=>d.name==='detectQueueBackpressure'&&d.status==='complete'));
   assert.ok(report.detectors.some(d=>d.status==='failed'));
   assert.ok(report.detectors.some(d=>d.status==='complete'));
   assert.ok(report.findings.some(f=>f.id==='outbound-no-timeout'));

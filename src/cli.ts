@@ -4,8 +4,7 @@ import { renderMarkdown } from "./reportMarkdown.js";
 import { isRemote } from "./clone.js";
 import type { Severity } from "./types.js";
 import { assertSupportedNode } from "./runtime.js";
-
-const SEVERITY_RANK: Record<Severity, number> = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
+import { SEVERITY_RANK } from "./findings.js";
 
 interface Args {
   debug: boolean;

@@ -57,7 +57,7 @@ Lifecycle checks follow visible startup calls and runtime imports per service, i
 
 Startup checks retain argument bindings and allocation identity for each helper invocation. Immutable local receiver and callback aliases preserve those bindings; destructured helper parameters remain conservative. Static imports and re-exports are evaluated before the module body. Awaited helpers and literal local imports contribute completed setup evidence to later startup work; helper evidence stays tied to its invocation, and asynchronous continuations do not protect earlier listeners. Awaited call arguments complete before the call itself starts. Known literal guards retain their evaluated execution path, while unknown guards remain uncertain. Conditional logical and optional-chain paths retain their skipped execution paths, including computed callee keys. Native rejected/pending awaits, returned awaits and finally completion overrides are distinguished. Visible Nest metadata member/array mutations are scoped to executed service owners and helper invocations; metadata aliases, property reassignment and copied-array capture are tracked alongside helper-supplied root modules. Nest metadata capture includes class static initialization. Route literals preserve erased TypeScript wrappers and captured property values. Decorator expressions follow the configured evaluation order; arbitrary returned decorator bodies remain conservative. Server discovery recognizes imported Koa constructors and Node HTTP/HTTPS factories independently of the receiver variable name. Listener discovery reuses shared summary indexes, and protection call sets are composed lazily without copying them into every entry. Traversal remains budgeted.
 
-Next priorities are baseline comparisons with reasoned suppressions, stable finding identities and SARIF export, and a repeatable real-repository precision/performance corpus. Further system-design checks should target demonstrable mechanisms such as queue backpressure, bounded caches, and retry amplification, with positive and negative examples before scoring them.
+The real-repository regression corpus checks that required detectors complete and compares findings, scores and coverage on pinned source. It also records audit time. See the [corpus instructions](tests/corpus/README.md). Future system-design checks include bounded caches and retry amplification. Baseline comparisons, reasoned suppressions and SARIF export are planned CI improvements.
 
 ## Usage
 
@@ -87,11 +87,13 @@ Local inputs can be a folder or an individual `.ts`, `.tsx`, `.mts`, `.cts`, `.j
 npx @pradeeppilot/scale-audit ./src/server.mts --format md
 ```
 
-Single-file audits analyze only the selected file (including for `--diff` and `--fix`). The nearest valid parent `package.json` selects the project root (stopping at a Git boundary), and package/Prisma metadata are read from that project; lifecycle findings cannot account for sibling source files. Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are excluded.
+Single-file audits report findings and coverage for the selected file. The nearest valid parent `package.json` selects the project root, stopping at a Git boundary, and supplies the scope for package and Prisma metadata. When `--diff` or `--fix` has a candidate timeout edit, it can inspect eligible sibling sources under the usual limits to verify the HTTP method and inherited deadline. Incomplete or ambiguous context leaves that edit for manual review. Generated edits stay within the selected file. Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are excluded.
 
 JSON reports include `coverage` with discovered and analyzed source counts and skipped paths/reasons. Markdown and HTML show the same accounting and warn when files were skipped or no source was analyzed. Counts cover eligible discovered source files after the normal directory, hidden-file, symlink, and test exclusions; excluded paths are not included. Scores apply only to analyzed source, and skipped files can still contain issues.
 
-Timeout detection checks the configuration position for each Axios method, recognizes positive literal Axios timeouts and explicit timer signals, and applies `axios.create()` defaults only to the corresponding variable binding. References to mutable defaults or client reassignment make inherited settings uncertain. Unsupported fetch timeout properties, disabled Axios timeouts, and Node HTTP timeout events alone do not establish request cancellation. Configurations that cannot be resolved are reported with low confidence.
+Timeout detection follows the Axios method called, including form submissions and visible method aliases. It checks the corresponding configuration argument, positive literal deadlines on the default client, and the creation options of each `axios.create()` instance. An explicit per-call option takes precedence. The audit reports low confidence when a changed client or configuration makes its deadline uncertain. Fetch needs a signal with a deadline. On Node HTTP, a timeout event requires a handler that aborts the request.
+
+Visible replacement of `AbortSignal` or its timer methods invalidates deadline evidence, including replacements in other analyzed files. The audit follows HTTP aliases at the point where they capture a function. Unknown global mutations and escaped clients leave the edit for manual review. An automatic timeout edit requires a known runtime client. A TypeScript path mapping alone cannot establish which package Node loads.
 
 ## Automated fixes
 
@@ -110,10 +112,12 @@ Timeout detection checks the configuration position for each Axios method, recog
 
 `--fix` applies only file plans whose edits are all marked safe. Pagination changes (which can truncate results) and added `await`s require review and are offered only by `--diff`; if a file contains any review-required edit, `--fix` skips that entire file. Raw SQL is never automatically rewritten. Existing cancellation/timeout options, variable configs, changed files, and symlinked paths are not overwritten. Reports distinguish generated suggestions from edits actually applied. Both modes are opt-in: a plain audit never writes to the target repository. Combining `--fix` with `--diff` or its deprecated `--verify`/`-v` aliases is rejected before auditing or writing files, in either argument order.
 
+Timeout fixes also stay manual when visible global mutation or escape makes the native `AbortSignal` factory uncertain, or when a configuration prototype could carry cancellation options.
+
 ## Detectors
 
 **DB** — N+1 queries, unbounded reads (pagination-aware), unbounded raw SQL (`$queryRaw`/`knex.raw` with no `LIMIT`), missing Prisma indexes (scoped to each project's own schema, composite-index aware)
-**Concurrency** — in-process session/rate-limit/state, WebSockets without a shared adapter, unbounded `Promise.all` over user-sized collections
+**Concurrency** — in-process session/rate-limit/state, WebSockets without a shared adapter, unbounded `Promise.all` over user-sized collections, and request-fed in-memory queues without visible backpressure
 **Connection** — a `PrismaClient`/`Pool` created per request instead of once per process
 **Correctness** — floating promises (an unawaited write that may never land) and `.then()` without `.catch()`
 **I/O** — blocking sync calls in request paths, image processing in handlers
@@ -121,6 +125,16 @@ Timeout detection checks the configuration position for each Axios method, recog
 **Performance** — independent calls awaited one after the other instead of concurrently
 **Observability** — missing health endpoint
 **Deps** — heavy/deprecated packages
+
+The queue check looks for a private module-level array, a request-reachable enqueue, and an interval that removes at most one job per tick. Findings point to the enqueue, queue declaration, and drain, and identify visible startup cancellation. Admission checks use resolved producer calls, including aliases, supported `.bind()` and `.call()` uses, and callbacks that the request analysis can establish will run. Multi-hop admission policies, external queue libraries, streams, escaped arrays, and unmodeled mutations are outside this check’s scope.
+
+Counter-based admission is checked across all visible request producers. Equality limits cannot prove a bound when a batch skips past them or another route bypasses them. Native callback stopping behavior and Boolean argument binding are included in this proof. Shared route and assignment histories reuse analysis work without raising the safety limits.
+
+Reading queue depth, checking membership with `includes`, or inspecting a job with `at` leaves producers visible. A capacity check must protect the enqueue on its own execution path. Promise reactions, native scheduling callbacks and asynchronous resource cleanup can let other requests pass an earlier check. A verified counter can reserve a slot immediately before an enqueue, including while its payload is awaited.
+
+Authentication checks, routing exits and opaque callbacks such as `admitJob(req)` do not prove a queue capacity limit. A bounded queue whose admission policy is outside the analyzed code may still require manual review. Counter guards must reject excess work and track every visible enqueue.
+
+Custom methods such as `guard.Boolean(full())` do not establish native Boolean coercion. An independently proven capacity guard still counts, but an unresolved custom wrapper can produce a warning for a bounded queue. Manual review should confirm that custom admission policies reject excess work at runtime.
 
 ## Score
 
@@ -153,8 +167,10 @@ A linter that cries wolf gets uninstalled, so every finding is grounded in evide
 - Query-builder methods (`select`, `from`, `where`) are not reads on their own; only the completed chain is.
 - GraphQL/SDK clients (`client.query({ query })`) are not mistaken for raw SQL.
 - Locally shadowed `fetch`/`axios` bindings and Axios utility exports are excluded from HTTP findings and timeout fixes; supported ESM/CommonJS import aliases retain their identity. Native `globalThis.fetch` and `undici.fetch` are also recognized.
-- Raw SQL checks evaluate each statement separately, ignore comments, quoted values and subquery-only limits, and distinguish scalar aggregates and non-returning writes from row reads. SQL analysis is conservative and is not a full dialect parser.
-- Missing-index checks descend into logical groups and known scalar filter operators while leaving relation subtrees separate. Deferred function declarations inside loops do not count as executed N+1 queries. Bare rejected promises and ineffective `.catch()` handlers are reported.
+- Raw SQL checks evaluate each statement separately, skip comments and quoted values when matching keywords, and distinguish scalar aggregates and non-returning writes from row reads. A direct column projection from a capped, nonrecursive common table expression inherits its row bound. Joins and projections that can expand rows still need their own bound. Mixing quoted and unquoted references to a table expression can produce a conservative warning.
+- Missing-index checks follow logical groups, scalar operators and direct `null` comparisons on nullable scalar fields. N+1 checks follow reads in resolved collection callbacks and reads collected in a loop for a later `Promise.all` or `Promise.allSettled`. Call-site findings carry a one-based column so independent calls on one line retain their severity and score.
+- Raw SQL checks recognize imported PostgreSQL pools and clients under local names. A projection of multiple ungrouped scalar aggregates has bounded result cardinality. Grouped and windowed results can grow with the data.
+- Bare rejected promises and ineffective `.catch()` handlers are reported.
 - Findings carry `confidence`; ambiguous cases (query or config passed as a variable) are reported as `low` instead of asserted.
 - A request path is matched on whole path segments, so `capitalize.ts` is not treated as an API route.
 
@@ -226,11 +242,17 @@ For local troubleshooting, `--debug` writes original detector exceptions and sta
 
 Cross-file binding-depth exhaustion marks affected detectors incomplete; genuine import cycles remain unresolved identities. Local module resolution tries direct source files before directory indexes and uses TypeScript-style extension substitution.
 
-DI analysis preserves conditional registration alternatives, ignores statically dead branches, and follows inherited Nest injection metadata. Mutable conditions cannot prove singleton reuse. TSyringe constructor-type inference requires an analyzed config with `emitDecoratorMetadata: true`; missing or disabled metadata is uncertain, while explicit injection tokens are still followed.
+DI analysis preserves conditional registration alternatives, ignores statically dead branches, and follows inherited Nest injection metadata. Scope aliases use visible assignment and capture timing; ambiguous writes and mutable conditions cannot prove singleton reuse. TSyringe constructor-type inference requires an analyzed config with `emitDecoratorMetadata: true`; missing or disabled metadata is uncertain, while explicit injection tokens are still followed.
 
 Precision checks distinguish imported Node HTTP APIs from shadowed local names, require native timer-signal identity for timeout proof, and avoid concurrency warnings for proven synchronous projections. Destructured results count as dependencies between awaited calls. SQL percentage caps and branch-local caps cannot establish a bound for an entire result set. These checks remain static heuristics, not execution or full framework/SQL semantic analysis.
 
-### 0.3.9 — remaining limits
+### In 0.4.0
+
+- The queue backpressure check follows request-side producers, capacity checks and interval drains. It reports a stale capacity check when a callback can run after other requests have passed the same check.
+- Timeout fixes preserve visible Axios deadline policies and payload arguments. Ambiguous client identities, module initialization or interceptor behavior leave the edit for manual review.
+- Findings carry call-site positions so a background warning cannot hide a request-path finding on the same line. Pinned repository audits and focused regression tests cover the CLI gate, detector precision and analysis work limits.
+
+### Analysis limits
 
 Startup completion through native promise combinators such as `Promise.resolve(install())` remains conservative and can produce a missing-setup warning even when the wrapper is awaited.
 
@@ -240,8 +262,8 @@ Class prototype mutations follow visible constructor and prototype aliases, incl
 
 Awaited dynamic-import cycles cannot establish completed setup; ordinary static cycles and dependencies that have already completed remain supported. Visible throws from local CommonJS dependencies stop subsequent helper setup while preserving reached prefixes. CommonJS paths available only through runtime helper arguments remain conservative when dependency ordering cannot be established.
 
-Async property initializers are checked by declaration identity and visible writes in the declaration source. Property mutations in other files require manual review. Subclass overrides of an inherited method's `this` property are not resolved by runtime instance type, so this pattern can still produce a false positive and needs manual review.
+Async property initializers follow declaration identity and visible local instance writes, so changing one instance does not change another instance's promise classification. Unknown receivers and constructors that may return a shared object remain conservative. Property mutations in other files require manual review. Subclass overrides of an inherited method's `this` property are not resolved by runtime instance type, so this pattern can still produce a false positive and needs manual review.
 
-Concurrency checks inspect executed callback work, including calls whose results are discarded. Known synchronous built-ins and inspectable synchronous helpers can stay quiet; unknown external calls and overridable untyped methods such as `x.toString()` remain conservative candidates. Primitive receiver annotations are static evidence, not runtime validation.
+Concurrency checks inspect executed callback work, including calls whose results are discarded. Visible JSON serialization hooks, coercion hooks and `Object.values`/`Object.entries` getters are checked for work started outside a limiter. The JSON check follows serializer and replacer return values and honors a known list of property names through nested objects. Calling a generator evaluates its parameter defaults and defers its body until iteration. Known synchronous built-ins and inspectable synchronous helpers can stay quiet. Unknown external calls and overridable untyped methods such as `x.toString()` remain conservative candidates. Generic built-in operations on unknown runtime data remain heuristics and cannot reveal invisible getters or hooks. Primitive receiver annotations provide static type evidence.
 
-Deferred operational changes: the 20 MB aggregate source cap remains fatal before workspace analysis; it does not produce a partial report. Any skipped source file still marks an audit incomplete and returns CLI exit 3 by default, including in the GitHub Action. These strict behaviors are unchanged in 0.3.9. SQL bounds remain conservative; an outer query reading only a bounded CTE may still be reported as unbounded.
+Exceeding the 20 MB aggregate source cap stops the audit before workspace analysis. A skipped source file makes the report incomplete and returns CLI exit 3 by default, including in the GitHub Action.

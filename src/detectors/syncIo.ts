@@ -1,7 +1,7 @@
 import { executionContexts, type ExecutionContext } from "../executionContext.js";
-import { importedBinding } from "../bindings.js";
+import { currentImportedBinding, symbolOf } from "../bindings.js";
 import ts from "typescript";
-import { lineOf, snippetAt, makeFinding } from "./common.js";
+import { locationOf, sourceSnippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
 import { requestReachability, type RequestReachability } from "../requestReachability.js";
@@ -29,7 +29,27 @@ const SYNC_BLOCKING = new Set([
   "deflateSync",
 ]);
 
-const IMAGE_LIBS = /\b(?:sharp|jimp|gm)\s*\(|\bimagemagick\b\s*[.(]/;
+const IMAGE_PACKAGES = new Set(["sharp", "jimp", "gm", "imagemagick"]);
+const IMAGE_OPERATIONS = new Set(["read", "fromBuffer", "convert", "resize", "identify", "mogrify", "composite"]);
+
+function imageCall(expression: ts.Expression): boolean {
+  const direct = ts.isIdentifier(expression);
+  const member = ts.isPropertyAccessExpression(expression) ? expression.name.text
+    : ts.isElementAccessExpression(expression) && ts.isStringLiteralLike(expression.argumentExpression) ? expression.argumentExpression.text : undefined;
+  if (!direct && member !== "default" && (!member || !IMAGE_OPERATIONS.has(member))) return false;
+  const imported = currentImportedBinding(expression);
+  if (imported && IMAGE_PACKAGES.has(imported.module)) {
+    return imported.name === "default" || imported.name === "*" || IMAGE_OPERATIONS.has(imported.name);
+  }
+  if (direct) return IMAGE_PACKAGES.has(expression.text) && !symbolOf(expression)?.declarations?.length;
+  if (member && (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression))) {
+    const receiver = expression.expression;
+    const binding = currentImportedBinding(receiver);
+    if (binding?.module === "jimp" && binding.name === "Jimp") return IMAGE_OPERATIONS.has(member);
+    return ts.isIdentifier(receiver) && IMAGE_PACKAGES.has(receiver.text) && !symbolOf(receiver)?.declarations?.length;
+  }
+  return false;
+}
 
 export async function detectSyncIo(root: string, ws?: Workspace): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -37,46 +57,37 @@ export async function detectSyncIo(root: string, ws?: Workspace): Promise<Findin
   const contexts = await executionContexts(root, workspace, isRequestPath);
   const requests = requestReachability(workspace);
   for (const unit of workspace.units) {
-    const { rel, content, sf } = unit;
+    const { rel, sf } = unit;
 
     const isScript = /(^|\/)(scripts?|tools?|bin|seed|migrations?|fixtures?|examples?)\//i.test(rel) || /\.config\.|webpack\.config|rollup\.config|vite\.config/i.test(rel);
     const context = contexts.get(rel);
     const hotPath = context?.request ?? false;
 
-    visitSync(sf, sf, content, rel, out, hotPath, isScript, context, requests);
-
-    if (IMAGE_LIBS.test(content) && hotPath) {
-      const ln = findLine(content, IMAGE_LIBS);
-      if (ln) {
-        out.push(
-          makeFinding({
-            id: "image-processing-in-request",
-            category: "I/O",
-            severity: "medium",
-            confidence: "low",
-            file: rel,
-            line: ln,
-            message: "Image processing appears in a request-path file.",
-            scaleTrigger: "CPU-bound image work blocks the event loop per request.",
-            suggestedFix: "Offload image processing to a background job / worker queue and cache results.",
-            snippet: snippetAt(content, ln),
-          }),
-        );
-      }
-    }
+    visitSync(sf, sf, rel, out, hotPath, isScript, context, requests);
   }
   return out;
 }
 
-function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, out: Finding[], hotPath: boolean, isScript: boolean, context?: ExecutionContext, requests?: RequestReachability) {
+function visitSync(node: ts.Node, sf: ts.SourceFile, rel: string, out: Finding[], hotPath: boolean, isScript: boolean, context: ExecutionContext | undefined, requests: RequestReachability) {
   if (ts.isCallExpression(node)) {
+    const request = requests.evidence(node);
+    if (request && imageCall(node.expression)) {
+      const location = locationOf(sf, node);
+      out.push(makeFinding({
+        id: "image-processing-in-request", category: "I/O", severity: "medium", confidence: "low",
+        file: rel, ...location, message: "A request path can invoke an image-processing library.",
+        scaleTrigger: "Concurrent image processing can consume CPU, worker capacity and memory as requests increase.",
+        suggestedFix: "Cache repeated transformations and bound concurrent image jobs.",
+        snippet: sourceSnippetAt(sf, location.line),
+      }));
+    }
     let name =
       ts.isPropertyAccessExpression(node.expression) ? node.expression.name.getText() : ts.isIdentifier(node.expression) ? node.expression.text : "";
-    const imported = importedBinding(node.expression);
+    const imported = currentImportedBinding(node.expression);
     if (imported && /^(node:)?(fs(?:\/promises)?|child_process|crypto|zlib)$/.test(imported.module)) name = imported.name;
-    if (SYNC_BLOCKING.has(name) || /(FileSync|DirSync)$/.test(name)) {
-      const ln = lineOf(sf, node);
-      const request = requests?.evidence(node);
+    if ((SYNC_BLOCKING.has(name) || /(FileSync|DirSync)$/.test(name))
+      && !requests.localSyncImplementation(node)) {
+      const location = locationOf(sf, node);
       const reached = request === "request";
       const inFunction = isInsideFunction(node);
       const startup = !inFunction && !isScript && !reached;
@@ -114,16 +125,16 @@ function visitSync(node: ts.Node, sf: ts.SourceFile, content: string, rel: strin
           severity,
           confidence,
           file: rel,
-          line: ln,
+          ...location,
           message,
           scaleTrigger,
           suggestedFix,
-          snippet: snippetAt(content, ln),
+          snippet: sourceSnippetAt(sf, location.line),
         }),
       );
     }
   }
-  ts.forEachChild(node, (c) => visitSync(c, sf, content, rel, out, hotPath, isScript, context, requests));
+  ts.forEachChild(node, (c) => visitSync(c, sf, rel, out, hotPath, isScript, context, requests));
 }
 
 function isInsideFunction(node: ts.Node): boolean {
@@ -144,12 +155,6 @@ function isInsideFunction(node: ts.Node): boolean {
     cur = cur.parent;
   }
   return false;
-}
-
-function findLine(content: string, re: RegExp): number | null {
-  const lines = content.split("\n");
-  for (let i = 0; i < lines.length; i++) if (re.test(lines[i])) return i + 1;
-  return null;
 }
 
 /**

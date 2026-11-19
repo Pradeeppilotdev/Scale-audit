@@ -1,7 +1,11 @@
 import ts from "typescript";
 import { AnalysisBudget, AnalysisLimitError, projectWorkLimit } from "./analysisBudget.js";
-import { definitionOf, importedBinding, projectFor, symbolOf } from "./bindings.js";
+import { bindingWriteIndex, definitionOf, importedBinding, isCommonJsExportTarget, isCommonJsRequire, nativeScheduler, projectFor, symbolOf } from "./bindings.js";
+import { conditionTruth } from "./conditionTruth.js";
 import type { Workspace } from "./workspace.js";
+
+type InvocationSite = ts.CallExpression | ts.NewExpression;
+type QueueBatch = boolean | "deferred" | ts.Expression;
 
 type Callable = ts.FunctionLikeDeclaration & { body: ts.ConciseBody };
 interface Value { node: ts.Node; env: Environment; bound?: { id: number; args: Value[][]; receiver?: Value }; memberReceiver?: Value; fieldOwner?: { id: number; owner: ts.ClassLikeDeclaration; env: Environment; fields: ReadonlySet<ts.PropertyDeclaration>; before?: ts.PropertyDeclaration; previous?: Value["fieldOwner"] } }
@@ -26,13 +30,154 @@ function callable(node: ts.Node): node is Callable {
   return ts.isFunctionLike(node) && !!(node as ts.FunctionLikeDeclaration).body;
 }
 
+const loopBindingsByBudget = new WeakMap<AnalysisBudget, WeakMap<ts.IterationStatement, { source: ts.Expression; nodes: readonly ts.Node[] }>>();
+
+/** Count known row properties once. A wide binding pattern should not inspect
+ * every row again for each default. The same list drives suspension and call evidence. */
+export function loopBindingEvaluations(loop: ts.ForInStatement | ts.ForOfStatement, budget: AnalysisBudget,
+  source = loop.expression): readonly ts.Node[] {
+  let cache = loopBindingsByBudget.get(budget);
+  if (!cache) { cache = new WeakMap(); loopBindingsByBudget.set(budget, cache); }
+  const cached = cache.get(loop);
+  if (cached?.source === source) return cached.nodes;
+  const unwrap = (node: ts.Expression): ts.Expression => {
+    while (transparent(node)) { budget.take(); node = node.expression; }
+    return node;
+  };
+  const defined = (node: ts.Expression): boolean => {
+    const value = unwrap(node);
+    return ts.isLiteralExpression(value) || ts.isObjectLiteralExpression(value) || ts.isArrayLiteralExpression(value)
+      || ts.isFunctionExpression(value) || ts.isArrowFunction(value) || ts.isClassExpression(value)
+      || ts.isTemplateExpression(value) || value.kind === ts.SyntaxKind.NullKeyword
+      || value.kind === ts.SyntaxKind.TrueKeyword || value.kind === ts.SyntaxKind.FalseKeyword
+      || ts.isPrefixUnaryExpression(value) && (value.operator === ts.SyntaxKind.MinusToken
+        && ts.isBigIntLiteral(unwrap(value.operand)) || (value.operator === ts.SyntaxKind.MinusToken
+          || value.operator === ts.SyntaxKind.PlusToken) && ts.isNumericLiteral(unwrap(value.operand)));
+  };
+  const { initializer } = loop;
+  const pattern = ts.isVariableDeclarationList(initializer) && initializer.declarations.length === 1
+    ? initializer.declarations[0].name : undefined;
+  const rows = unwrap(source);
+  const nodes: ts.Node[] = [];
+  if (!ts.isForOfStatement(loop) || loop.awaitModifier || !pattern || ts.isIdentifier(pattern) || !ts.isArrayLiteralExpression(rows)) {
+    nodes.push(initializer);
+  } else if (rows.elements.length) {
+    const pending: Array<{ pattern: ts.BindingPattern; rows: readonly ts.Expression[] }> = [{ pattern, rows: rows.elements }];
+    while (pending.length) {
+      const task = pending.pop()!;
+      const array = ts.isArrayBindingPattern(task.pattern);
+      const selected = new Map<string, Array<ts.Expression | null>>();
+      let unknown = false;
+      for (const item of task.rows) {
+        budget.take();
+        const row = unwrap(item);
+        const provided = new Map<string, ts.Expression | null>();
+        if (array && ts.isArrayLiteralExpression(row)) {
+          for (const [index, member] of row.elements.entries()) {
+            budget.take();
+            if (ts.isSpreadElement(member)) break;
+            if (defined(member)) provided.set(String(index), member);
+          }
+        } else if (!array && ts.isObjectLiteralExpression(row)) {
+          for (const member of row.properties) {
+            budget.take();
+            const key = propertyName(member.name);
+            if (key === undefined) provided.clear();
+            else if (ts.isMethodDeclaration(member)) provided.set(key, null);
+            else if (key !== "__proto__" && ts.isPropertyAssignment(member) && defined(member.initializer)) provided.set(key, member.initializer);
+            else provided.delete(key);
+          }
+        } else { unknown = true; break; }
+        for (const [key, value] of provided) {
+          budget.take();
+          const entries = selected.get(key);
+          if (entries) entries.push(value); else selected.set(key, [value]);
+        }
+      }
+      if (unknown) { nodes.push(task.pattern); continue; }
+      for (const [index, element] of task.pattern.elements.entries()) {
+        budget.take();
+        if (ts.isOmittedExpression(element)) continue;
+        if (element.propertyName && ts.isComputedPropertyName(element.propertyName)) nodes.push(element.propertyName.expression);
+        const name = element.propertyName ?? (ts.isIdentifier(element.name) ? element.name : undefined);
+        const key = array ? String(index) : propertyName(name);
+        const values = !element.dotDotDotToken && key !== undefined ? selected.get(key) : undefined;
+        const guaranteed = values?.length === task.rows.length;
+        if (element.initializer && !guaranteed) nodes.push(element.initializer);
+        if (!ts.isIdentifier(element.name)) {
+          if (guaranteed && values.every((value): value is ts.Expression => { budget.take(); return !!value; })) {
+            pending.push({ pattern: element.name, rows: values });
+          } else nodes.push(element.name);
+        }
+      }
+    }
+  }
+  cache.set(loop, { source, nodes });
+  return nodes;
+}
+
 /** Per-call evidence, distinct from module import reachability. Unknown callback
  * execution remains possible evidence rather than a verified request path. */
-export interface RequestReachability { evidence(node: ts.CallExpression): "request" | "possible" | undefined }
+export interface RequestReachability {
+  evidence(node: ts.CallExpression): "request" | "possible" | undefined;
+  /** Resolved incoming request calls when the project has a private queue.
+   * A null site represents a request entry. An expression is the known length
+   * input to a batch, and true represents fan-out with no resolved length. */
+  queueCallers(target: ts.SignatureDeclaration): ReadonlyMap<InvocationSite | null, QueueBatch> | undefined;
+  /** A bounded native batch may still invoke one callback more than once. */
+  unitQueueCaller(target: ts.SignatureDeclaration, site: InvocationSite): boolean;
+  /** Whether a request site's .call lookup resolved to a native callable helper. */
+  nativeQueueCall(site: ts.CallExpression): boolean;
+  nativeMathUnchanged(): boolean;
+  /** A Sync-named call with a stable source implementation is not, by spelling
+   * alone, a native blocking operation. Calls inside that body remain analyzed. */
+  localSyncImplementation(node: ts.CallExpression): boolean;
+}
+const requestGraphs = new WeakMap<Workspace, RequestReachability | AnalysisLimitError>();
+
 export function requestReachability(workspace: Workspace): RequestReachability {
+  const cached = requestGraphs.get(workspace);
+  if (cached instanceof AnalysisLimitError) throw cached;
+  if (cached) return cached;
+  try {
+    const graph = buildRequestReachability(workspace);
+    requestGraphs.set(workspace, graph);
+    return graph;
+  } catch (error) {
+    // The same immutable workspace will hit the same limit for every consumer.
+    if (error instanceof AnalysisLimitError) requestGraphs.set(workspace, error);
+    throw error;
+  }
+}
+
+function buildRequestReachability(workspace: Workspace): RequestReachability {
   const budget = new AnalysisBudget("Request reachability", projectWorkLimit(workspace.units.map(unit => unit.sf)));
   const evidence = new WeakMap<ts.CallExpression, boolean>();
+  const queueCallers = new WeakMap<ts.Node, Map<InvocationSite | null, QueueBatch>>();
+  const repeatedQueueCallers = new WeakMap<ts.Node, WeakSet<InvocationSite>>();
+  const nativeQueueCalls = new WeakMap<ts.CallExpression, boolean>();
+  const localSyncImplementations = new WeakMap<ts.CallExpression, boolean>();
+  let hasQueueProducer = false;
+  const recordQueueCaller = (target: ts.Node, caller: InvocationSite | null, batch: QueueBatch = false, unit = true): void => {
+    if (!hasQueueProducer) return;
+    if (caller && !unit) {
+      budget.take();
+      let repeated = repeatedQueueCallers.get(target);
+      if (!repeated) { repeated = new WeakSet(); repeatedQueueCallers.set(target, repeated); }
+      repeated.add(caller);
+    }
+    let callers = queueCallers.get(target);
+    const previous = callers?.get(caller);
+    const combined = previous === "deferred" || batch === "deferred" ? "deferred"
+      : previous && batch && previous !== batch ? true : previous || batch;
+    if (previous !== combined) {
+      budget.take();
+      if (!callers) { callers = new Map(); queueCallers.set(target, callers); }
+      callers.set(caller, combined);
+    }
+  };
   const writes = new Map<ts.Declaration, Write[]>();
+  const assignedImplementations = new Set<ts.Declaration>();
   const definiteWrites = new Set<ts.Node>();
   const unsafeReceivers = new Set<ts.Node>();
   const unsafeCallables = new Set<ts.Node>();
@@ -145,26 +290,32 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     properties.set(object, known); return known;
   };
   const writeDeclarations = new WeakMap<ts.Declaration, ts.Declaration>();
-  const classWriteDeclarations = new WeakMap<ts.ClassLikeDeclaration, Map<string, ts.Declaration>>();
+  interface ClassMembers { fields: ts.PropertyDeclaration[]; prototype?: ts.ClassElement; firstWrite?: ts.Declaration }
+  const classMemberIndexes = new WeakMap<ts.ClassLikeDeclaration, Map<string, ClassMembers>>();
+  const classMembers = (owner: ts.ClassLikeDeclaration): Map<string, ClassMembers> => {
+    budget.take();
+    const cached = classMemberIndexes.get(owner); if (cached) return cached;
+    const entries = new Map<string, ClassMembers>();
+    for (const member of owner.members) {
+      budget.take();
+      const name = propertyName(member.name); if (name === undefined) continue;
+      const isStatic = ts.canHaveModifiers(member) && ts.getModifiers(member)?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword);
+      const key = `${isStatic ? 1 : 0}:${name}`;
+      const entry = entries.get(key) ?? { fields: [] };
+      if (ts.isPropertyDeclaration(member)) entry.fields.push(member);
+      else entry.prototype = member;
+      if (ts.isPropertyDeclaration(member) || ts.isMethodDeclaration(member)) entry.firstWrite ??= member;
+      entries.set(key, entry);
+    }
+    classMemberIndexes.set(owner, entries); return entries;
+  };
   const writeDeclaration = (declaration: ts.Declaration): ts.Declaration => {
     const known = writeDeclarations.get(declaration); if (known) return known;
     let canonical = declaration;
     if ((ts.isPropertyDeclaration(declaration) || ts.isMethodDeclaration(declaration)) && (ts.isClassDeclaration(declaration.parent) || ts.isClassExpression(declaration.parent))) {
-      let entries = classWriteDeclarations.get(declaration.parent);
-      if (!entries) {
-        entries = new Map();
-        for (const member of declaration.parent.members) {
-          budget.take();
-          if (!ts.isPropertyDeclaration(member) && !ts.isMethodDeclaration(member)) continue;
-          const name = propertyName(member.name); if (name === undefined) continue;
-          const key = `${member.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword) ? 1 : 0}:${name}`;
-          if (!entries.has(key)) entries.set(key, member);
-        }
-        classWriteDeclarations.set(declaration.parent, entries);
-      }
       const name = propertyName(declaration.name);
       const key = `${declaration.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword) ? 1 : 0}:${name}`;
-      canonical = entries.get(key) ?? declaration;
+      canonical = classMembers(declaration.parent).get(key)?.firstWrite ?? declaration;
     }
     writeDeclarations.set(declaration, canonical); return canonical;
   };
@@ -194,8 +345,50 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     if (written?.kind === ts.SyntaxKind.ThisKeyword || read?.kind === ts.SyntaxKind.ThisKeyword) return true;
     return !written || !read || written === read;
   };
+  interface WriteHistory { values: Write[]; uncertainAt: number }
+  interface VariableWrites { scopes: Set<ts.FunctionLikeDeclaration>; histories: Map<ts.FunctionLikeDeclaration | undefined, WriteHistory> }
+  const variableWrites = new WeakMap<ts.VariableDeclaration, VariableWrites | null>();
+  const variableWriteHistory = (declaration: ts.VariableDeclaration, indexed: Write[]): VariableWrites | undefined => {
+    const known = variableWrites.get(declaration);
+    if (known !== undefined) return known ?? undefined;
+    const result: VariableWrites = { scopes: new Set(), histories: new Map() };
+    for (const write of indexed) {
+      budget.take();
+      // Property/instance writes retain their receiver and field-phase checks.
+      if (!ts.isIdentifier(write.node.left)) { variableWrites.set(declaration, null); return undefined; }
+      if (write.scope) result.scopes.add(write.scope);
+      let history = result.histories.get(write.scope);
+      if (!history) { history = { values: [], uncertainAt: Infinity }; result.histories.set(write.scope, history); }
+      if (!write.definite) history.uncertainAt = Math.min(history.uncertainAt, history.values.length);
+      history.values.push(write);
+    }
+    variableWrites.set(declaration, result);
+    return result;
+  };
+  const precedingWrite = (history: WriteHistory | undefined, position: number): ts.Expression | null | undefined => {
+    if (!history) return undefined;
+    let left = 0, right = history.values.length;
+    while (left < right) {
+      budget.take(); const middle = (left + right) >>> 1;
+      if (history.values[middle].node.pos < position) left = middle + 1;
+      else right = middle;
+    }
+    if (history.uncertainAt < left) return null;
+    return history.values[left - 1]?.value;
+  };
   const replacement = (declaration: ts.Declaration, use: ts.Node): ts.Expression | null | undefined => {
     const indexed = writes.get(writeDeclaration(declaration));
+    if (stableResolutionPhase && indexed?.length && ts.isVariableDeclaration(declaration)) {
+      budget.take();
+      const history = variableWriteHistory(declaration, indexed);
+      if (history) {
+        const scope = enclosing(use);
+        if (history.scopes.size > 1 || history.scopes.size === 1 && (!scope || !history.scopes.has(scope))) return null;
+        const module = precedingWrite(history.histories.get(undefined), scope ? Infinity : use.pos);
+        const local = scope ? precedingWrite(history.histories.get(scope), use.pos) : undefined;
+        return module === null || local === null ? null : local ?? module;
+      }
+    }
     const values = indexed?.filter(write => { budget.take(); return !overwrittenByField(write, declaration) && sameWriteReceiver(write, use); });
     if (!values?.length) return undefined;
     const scope = enclosing(use);
@@ -317,11 +510,12 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     callableProjections.set(values, projection);
     return projection.values;
   };
-  const invoke = (fn: Value, args: Value[][], request?: boolean, receiver?: Value, plan?: ConstructorPlan, deferred = false): void => {
+  const invoke = (fn: Value, args: Value[][], request?: boolean, receiver?: Value, plan?: ConstructorPlan, deferred = false, caller?: InvocationSite, batch: QueueBatch = false, unit = true): void => {
     const previousInitializations = deferred ? new Map(activeInitializations) : undefined;
     if (deferred) { budget.take(activeInitializations.size); activeInitializations.clear(); }
     try {
     if (!callable(fn.node) || request === undefined && !registrationCandidates.has(fn.node)) return;
+    if (request === true && caller) recordQueueCaller(fn.node, caller, batch, unit);
     if (fn.bound) { budget.take(fn.bound.args.length + args.length); args = [...fn.bound.args, ...args]; receiver = fn.bound.receiver; }
     receiver = receiverFor(fn, receiver);
     const key = `${request === undefined ? "setup" : request ? "request" : "possible"}:${valueKey(fn)}:${receiver ? valueKey(receiver) : ""}:${argumentSignature(args)}:${plan?.id ?? 0}:${initializationSignature()}`;
@@ -337,7 +531,7 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     }
   };
   const commonJsDefault = (call: ts.CallExpression, env: Environment, seen: Set<ts.Node>): ts.Expression | undefined => {
-    if (!ts.isIdentifier(call.expression) || call.expression.text !== "require" || symbolOf(call.expression)?.declarations?.length) return undefined;
+    if (!isCommonJsRequire(call.expression)) return undefined;
     const specifier = call.arguments[0];
     if (!specifier || !ts.isStringLiteralLike(specifier)) return undefined;
     const project = projectFor(call.getSourceFile());
@@ -351,7 +545,7 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       budget.take(); const node = pending.pop()!;
       if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
         && ts.isPropertyAccessExpression(node.left) && node.left.name.text === "exports"
-        && ts.isIdentifier(node.left.expression) && node.left.expression.text === "module" && !symbolOf(node.left.expression)?.declarations?.some(declaration => !ts.isBinaryExpression(declaration))) {
+        && ts.isIdentifier(node.left.expression) && node.left.expression.text === "module" && isCommonJsExportTarget(node.left)) {
         if (node.operatorToken.kind !== ts.SyntaxKind.EqualsToken || !ts.isExpressionStatement(node.parent) || node.parent.parent !== source) uncertain = true;
         else if (node.pos > position) { position = node.pos; value = node.right; }
       }
@@ -377,12 +571,12 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     if (ts.isIdentifier(node)) {
       if (node.text === "undefined" && !symbolOf(node)?.declarations?.length) return [{ node, env: empty }];
       const direct = symbolOf(node)?.valueDeclaration;
-      // A property alias must resolve the property access in its captured
-      // receiver context; following its symbol straight to the field loses
-      // the lexical this of an instance arrow initializer.
-      const propertyAlias = direct && ts.isVariableDeclaration(direct) && direct.initializer
-        && (ts.isPropertyAccessExpression(direct.initializer) || ts.isElementAccessExpression(direct.initializer));
-      const declaration = propertyAlias ? direct : definitionOf(node) ?? direct;
+      // Local aliases must retain their declaration and capture position.
+      // Following only the initializer's symbol skips the alias's later
+      // writes, and property aliases also lose their lexical receiver.
+      const localAlias = direct && ts.isVariableDeclaration(direct) && direct.initializer
+        && (ts.isIdentifier(direct.initializer) || ts.isPropertyAccessExpression(direct.initializer) || ts.isElementAccessExpression(direct.initializer));
+      const declaration = localAlias ? direct : definitionOf(node) ?? direct;
       if (!declaration || declaration === node || uncertainBindings.has(declaration)) return [];
       return resolve(declaration, lexical(declaration, env), use, next, factories);
     }
@@ -619,6 +813,8 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     return result;
   };
   const truth = (node: ts.Expression, env: Environment, seen = new Set<ts.Node>(), factories = false): boolean | undefined => {
+    const syntactic = conditionTruth(node, budget);
+    if (syntactic !== undefined) return syntactic;
     let result: boolean | undefined;
     for (const value of literalValues(node, env, seen, factories)) {
       budget.take();
@@ -900,6 +1096,40 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     }
     return false;
   };
+  const constantBodies = new WeakMap<ts.Block, boolean>();
+  const hasConstantCompletion = (body: ts.Block): boolean => {
+    const known = constantBodies.get(body); if (known !== undefined) return known;
+    const pending: ts.Expression[] = [];
+    let constant = true;
+    for (const statement of body.statements) {
+      budget.take();
+      if (ts.isExpressionStatement(statement)) pending.push(statement.expression);
+      else if (ts.isReturnStatement(statement)) { if (statement.expression) pending.push(statement.expression); break; }
+      else if (!ts.isEmptyStatement(statement)) { constant = false; break; }
+    }
+    while (constant && pending.length) {
+      budget.take(); const value = pending.pop()!;
+      if (ts.isLiteralExpression(value) || value.kind === ts.SyntaxKind.TrueKeyword || value.kind === ts.SyntaxKind.FalseKeyword
+        || value.kind === ts.SyntaxKind.NullKeyword || ts.isArrowFunction(value) || ts.isFunctionExpression(value)) continue;
+      if (ts.isIdentifier(value)) {
+        const definition = symbolOf(value)?.valueDeclaration;
+        // A factory can return its own class, possibly inside a descriptor.
+        constant = !!definition && (ts.isFunctionDeclaration(definition) || definition === body.parent.parent
+          && (ts.isClassDeclaration(definition) || ts.isClassExpression(definition)));
+      } else if (transparent(value) || ts.isVoidExpression(value)) pending.push(value.expression);
+      else if (ts.isArrayLiteralExpression(value)) {
+        for (const element of value.elements) { budget.take(); if (!ts.isOmittedExpression(element)) pending.push(element); }
+      } else if (ts.isObjectLiteralExpression(value)) {
+        for (const property of value.properties) {
+          budget.take();
+          if (ts.isPropertyAssignment(property) && !ts.isComputedPropertyName(property.name)) pending.push(property.initializer);
+          else if (ts.isShorthandPropertyAssignment(property) && !property.objectAssignmentInitializer) pending.push(property.name);
+          else { constant = false; break; }
+        }
+      } else constant = false;
+    }
+    constantBodies.set(body, constant); return constant;
+  };
   // Completion is separate from expression traversal: a return in one possible
   // branch must not suppress its sibling, but a definitely completed block must
   // not manufacture request evidence from its unreachable tail. Cache by bound
@@ -908,7 +1138,12 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     budget.take();
     completionDepth(depth);
     let cache = statementFlows.get(node);
-    const known = cache?.get(env.id); if (known) return reuseCompletion(known, depth);
+    // A completed straight-line literal body has the same exits and reachable
+    // statements for every binding. Entry defaults and arguments are still
+    // evaluated at each call, and reuse still charges the original depth.
+    const known = cache?.get(env.id) ?? (cache?.size && ts.isBlock(node) && ts.isFunctionLike(node.parent)
+      && hasConstantCompletion(node) ? cache.values().next().value : undefined);
+    if (known) return reuseCompletion(known, depth);
     const frame = startCompletion(depth);
     try {
     const child = (value: ts.Node): StatementFlow => statementFlow(value, env, depth + 1);
@@ -1149,21 +1384,9 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     }
     parameterOrders.set(fn, order); return order;
   };
-  const defaultExits = (fn: ts.FunctionLikeDeclaration, args: Value[][], env: Environment, depth: number, request?: boolean, schedule = false, evaluator?: DefaultEvaluator): number => {
-    const order = parameterOrder(fn), previousInitialization = activeInitializations.get(env);
-    let cursor = 0;
-    const initializedBinding = (declaration: ts.Declaration): void => {
-      const position = order.get(declaration);
-      if (position !== undefined) { cursor = Math.max(cursor, position + 1); activeInitializations.set(env, { order, cursor }); }
-    };
-    activeInitializations.set(env, { order, cursor });
-    try {
-    const evaluate = (expression: ts.Expression, possible: boolean, level: number, uncertain = false): number => {
-      budget.take(); completionDepth(level);
-      if (schedule) enqueue({ node: expression, env, request: uncertain && request === true ? false : request });
-      const result = evaluator ? evaluator(expression, possible, level) : expressionExits(expression, env, level);
-      return result | (possible ? NORMAL : 0);
-    };
+  const patternEvaluation = (env: Environment,
+    evaluate: (expression: ts.Expression, possible: boolean, level: number, uncertain?: boolean) => number,
+    initializedBinding?: (declaration: ts.Declaration) => void) => {
     const initialize = (input: PatternInput, initializer: ts.Expression | undefined, level: number): { input: PatternInput; exits: number } => {
       budget.take(); completionDepth(level);
       if (!initializer) return { input, exits: NORMAL };
@@ -1207,14 +1430,32 @@ export function requestReachability(workspace: Workspace): RequestReachability {
         const selected = element.dotDotDotToken ? unknownPattern(element, env) : patternProperty(valid, key, ts.isArrayBindingPattern(name) ? index : undefined, element, env);
         const initialized = initialize(selected, element.initializer, level + 1);
         exits = (exits & THROW) | initialized.exits;
-        env.parameters.set(element, initialized.input.values);
+        if (initializedBinding) env.parameters.set(element, initialized.input.values);
         if (exits & NORMAL) {
           exits = (exits & THROW) | bindPattern(element.name, initialized.input, level + 1);
-          if (exits & NORMAL && ts.isIdentifier(element.name)) initializedBinding(element);
+          if (exits & NORMAL && ts.isIdentifier(element.name)) initializedBinding?.(element);
         }
       }
       return exits;
     };
+    return { initialize, bindPattern };
+  };
+  const defaultExits = (fn: ts.FunctionLikeDeclaration, args: Value[][], env: Environment, depth: number, request?: boolean, schedule = false, evaluator?: DefaultEvaluator): number => {
+    const order = parameterOrder(fn), previousInitialization = activeInitializations.get(env);
+    let cursor = 0;
+    const initializedBinding = (declaration: ts.Declaration): void => {
+      const position = order.get(declaration);
+      if (position !== undefined) { cursor = Math.max(cursor, position + 1); activeInitializations.set(env, { order, cursor }); }
+    };
+    activeInitializations.set(env, { order, cursor });
+    try {
+    const evaluate = (expression: ts.Expression, possible: boolean, level: number, uncertain = false): number => {
+      budget.take(); completionDepth(level);
+      if (schedule) enqueue({ node: expression, env, request: uncertain && request === true ? false : request });
+      const result = evaluator ? evaluator(expression, possible, level) : expressionExits(expression, env, level);
+      return result | (possible ? NORMAL : 0);
+    };
+    const { initialize, bindPattern } = patternEvaluation(env, evaluate, initializedBinding);
     let exits = NORMAL;
     for (let index = 0; index < fn.parameters.length && exits & NORMAL; index++) {
       budget.take(); const parameter = fn.parameters[index];
@@ -1378,15 +1619,13 @@ export function requestReachability(workspace: Workspace): RequestReachability {
   // order. Within either storage layer, a later declaration replaces an earlier
   // one; prefix receivers exclude fields whose initializer has not finished.
   const selectedClassMember = (owner: ts.ClassLikeDeclaration, name: string, instance: boolean, receiver: Value): ts.ClassElement | undefined => {
-    let field: ts.PropertyDeclaration | undefined, prototype: ts.ClassElement | undefined;
-    for (const member of owner.members) {
-      budget.take();
-      const isStatic = !!(ts.canHaveModifiers(member) && ts.getModifiers(member)?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword));
-      if (propertyName(member.name) !== name || isStatic === instance) continue;
-      if (ts.isPropertyDeclaration(member)) { if (fieldInstalled(receiver, member)) field = member; }
-      else prototype = member;
+    const members = classMembers(owner).get(`${instance ? 0 : 1}:${name}`);
+    if (!members) return undefined;
+    if (!receiver.fieldOwner) return members.fields.at(-1) ?? members.prototype;
+    for (let i = members.fields.length - 1; i >= 0; i--) {
+      budget.take(); if (fieldInstalled(receiver, members.fields[i])) return members.fields[i];
     }
-    return field ?? prototype;
+    return members.prototype;
   };
   const inheritedMemberValues = (owner: ts.ClassLikeDeclaration, env: Environment, receiver: Value, name: string, use: ts.Node, seen: Set<ts.Node>, factories: boolean, active = new Set<ts.Node>()): Value[] => {
     budget.take(); if (active.has(owner)) return [];
@@ -1468,9 +1707,9 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     keys.add(key);
     entries.push({ fn, args, receiver, plan });
   };
-  const invokeConstructorEntries = (entries: ConstructorInvocation[] | undefined, request: boolean | undefined): boolean => {
+  const invokeConstructorEntries = (entries: ConstructorInvocation[] | undefined, request: boolean | undefined, caller: InvocationSite): boolean => {
     if (!entries) return false;
-    for (const entry of entries) { budget.take(); invoke(entry.fn, entry.args, request, entry.receiver, entry.plan); }
+    for (const entry of entries) { budget.take(); invoke(entry.fn, entry.args, request, entry.receiver, entry.plan, false, caller); }
     return true;
   };
 
@@ -1770,7 +2009,7 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       }
       if (sorting) {
         const present: number[] = [];
-        for (const index of indices) { budget.take(); const item = shape?.items[index]; if (!item || !item.every(value => { budget.take(); return isUndefinedValue(value); })) present.push(index); }
+        for (const index of indices) { budget.take(); const item = shape?.items[index]; if (!item?.length || !item.every(value => { budget.take(); return isUndefinedValue(value); })) present.push(index); }
         indices.length = 0;
         for (const index of present) { budget.take(); indices.push(index); }
         count = Math.min(2, Math.max(0, indices.length - 1));
@@ -2096,6 +2335,27 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     }
     return { children, invokes: true };
   };
+  const patternEffects = new WeakMap<ts.BindingPattern, boolean>();
+  const evaluatesBindings = (pattern: ts.BindingPattern): boolean => {
+    const known = patternEffects.get(pattern);
+    if (known !== undefined) return known;
+    const pending = [pattern];
+    while (pending.length) for (const element of pending.pop()!.elements) {
+      budget.take();
+      if (ts.isOmittedExpression(element)) continue;
+      if (element.initializer || element.propertyName && ts.isComputedPropertyName(element.propertyName)) {
+        patternEffects.set(pattern, true); return true;
+      }
+      if (!ts.isIdentifier(element.name)) pending.push(element.name);
+    }
+    patternEffects.set(pattern, false); return false;
+  };
+  const evaluatedBinding = (pattern: ts.BindingPattern, input: PatternInput, env: Environment, pending: ts.Node[]): void => {
+    patternEvaluation(env, (expression, possible, level) => {
+      budget.take(); pending.push(expression);
+      return expressionExits(expression, env, level) | (possible ? NORMAL : 0);
+    }).bindPattern(pattern, input, 0);
+  };
   const evaluatedChildren = (node: ts.Node, env: Environment, pending: ts.Node[]): boolean => {
     if (ts.isArrayLiteralExpression(node) && inertArray(node)) return true;
     const values = valueExpressionChildren(node);
@@ -2137,6 +2397,15 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       }
       return true;
     }
+    if (ts.isVariableDeclaration(node) && !ts.isIdentifier(node.name) && node.initializer) {
+      pending.push(node.initializer);
+      if (evaluatesBindings(node.name) && expressionExits(node.initializer, env) & NORMAL) {
+        const values = patternValues(resolve(node.initializer, env));
+        const input = values.length ? { values, uncertain: false } : unknownPattern(node.initializer, env);
+        evaluatedBinding(node.name, input, env, pending);
+      }
+      return true;
+    }
     if (ts.isWhileStatement(node) || ts.isForStatement(node) || ts.isDoStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
       if (ts.isForStatement(node) && node.initializer) {
         pending.push(node.initializer);
@@ -2146,6 +2415,19 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       if (ts.isForInStatement(node) || ts.isForOfStatement(node)) {
         pending.push(node.expression);
         if (!(expressionExits(node.expression, env) & NORMAL)) return true;
+        const binding = ts.isVariableDeclarationList(node.initializer) ? node.initializer.declarations[0]?.name : undefined;
+        if (binding && !ts.isIdentifier(binding) && evaluatesBindings(binding)) {
+          const shape = ts.isForOfStatement(node) && !node.awaitModifier ? arrayElements(node.expression, env) : undefined;
+          if (shape?.items.length === 0) return true;
+          const source = shape && shape.items.length > 1 && collectionExpression(node.expression, env)?.node;
+          if (source && ts.isArrayLiteralExpression(source)) {
+            for (const child of loopBindingEvaluations(node, budget, source)) { budget.take(); pending.push(child); }
+          } else {
+            const values = shape?.items.length === 1
+              ? shape.holes[0] ? [undefinedValue] : patternValues(shape.items[0]) : [];
+            evaluatedBinding(binding, values.length ? { values, uncertain: false } : unknownPattern(binding, env), env, pending);
+          }
+        }
         pending.push(node.statement); return true;
       }
       const condition = ts.isWhileStatement(node) || ts.isDoStatement(node) ? node.expression : node.condition;
@@ -2288,8 +2570,8 @@ export function requestReachability(workspace: Workspace): RequestReachability {
         if (selected ?? declaration.initializer) return nativeHttpNamespace((selected ?? declaration.initializer)!, use, next);
       }
     }
-    if (ts.isCallExpression(expression) && ts.isIdentifier(expression.expression) && expression.expression.text === "require"
-      && !symbolOf(expression.expression)?.declarations?.length && expression.arguments[0] && ts.isStringLiteralLike(expression.arguments[0])) return /^(node:)?https?$/.test(expression.arguments[0].text);
+    if (ts.isCallExpression(expression) && isCommonJsRequire(expression.expression)
+      && expression.arguments[0] && ts.isStringLiteralLike(expression.arguments[0])) return /^(node:)?https?$/.test(expression.arguments[0].text);
     const imported = importedBinding(expression);
     return !!imported && /^(node:)?https?$/.test(imported.module) && ["*", "default"].includes(imported.name);
   };
@@ -2375,6 +2657,13 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     return { node: expression, env };
   };
   const undefinedValue: Value = { node: ts.factory.createVoidZero(), env: empty };
+  const callbackIndices = new Map<number, Value[]>();
+  const callbackIndex = (index: number): Value[] => {
+    budget.take();
+    let value = callbackIndices.get(index);
+    if (!value) { value = [{ node: ts.factory.createNumericLiteral(index), env: empty }]; callbackIndices.set(index, value); }
+    return value;
+  };
   const suppliedArguments = (fn: Value, count: number, origin: ts.Node): Value[][] => {
     const args: Value[][] = [];
     for (let index = 0; index < count; index++) {
@@ -2505,14 +2794,7 @@ export function requestReachability(workspace: Workspace): RequestReachability {
           }
           return { items, holes, logicalLength: source.logicalLength };
         }
-        const supplied = collectionExpression(value.node.arguments[0], value.env);
-        if (!mutatedCollectionGlobals.has("Object") && supplied && ts.isObjectLiteralExpression(supplied.node) && supplied.node.properties.length === 1) {
-          const property = supplied.node.properties[0];
-          if (ts.isPropertyAssignment(property) && propertyName(property.name) === "length") {
-            const length = literal(property.initializer, supplied.env);
-            if (length && ts.isNumericLiteral(length) && Number(length.text) === 0) return { items: [], holes: [] };
-          }
-        }
+        if (staticArrayLikeLength(value.node.arguments[0], value.env) === 0) return { items: [], holes: [] };
       }
       if (["map", "filter", "flatMap", "slice", "sort", "reverse", "flat"].includes(method) && collectionKind(owner, value.env) === "array") {
         const source = arrayElements(owner, value.env, next);
@@ -2535,14 +2817,53 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     }
     return { items, holes };
   };
-  const emptyArrayLike = (expression: ts.Expression, env: Environment): boolean => {
-    if (mutatedCollectionGlobals.has("Object")) return false;
+  // Consumers need only zero, one or a finite upper bound on repetitions.
+  const staticArrayLikeLength = (expression: ts.Expression, env: Environment): number | undefined => {
+    if (mutatedCollectionGlobals.has("Object")) return undefined;
     const value = collectionExpression(expression, env);
-    if (!value || !ts.isObjectLiteralExpression(value.node) || value.node.properties.length !== 1) return false;
+    if (value && ts.isStringLiteralLike(value.node)) {
+      if (mutatedCollectionGlobals.has("String")) return undefined;
+      let length = value.node.text.length;
+      // Longer strings necessarily have several code points. Avoid scanning
+      // their contents when only a single surrogate pair can change unitness.
+      if (length === 2) {
+        budget.take(2);
+        const first = value.node.text.charCodeAt(0), second = value.node.text.charCodeAt(1);
+        if (first >= 0xd800 && first <= 0xdbff && second >= 0xdc00 && second <= 0xdfff) length = 1;
+      }
+      return length;
+    }
+    if (!value || !ts.isObjectLiteralExpression(value.node) || value.node.properties.length !== 1) return undefined;
     const property = value.node.properties[0];
-    if (!ts.isPropertyAssignment(property) || propertyName(property.name) !== "length") return false;
+    if (!ts.isPropertyAssignment(property) || propertyName(property.name) !== "length") return undefined;
     const length = literal(property.initializer, value.env);
-    return !!length && ts.isNumericLiteral(length) && Number(length.text) === 0;
+    let numeric: number | undefined;
+    if (length && ts.isNumericLiteral(length)) numeric = Number(length.text);
+    else if (length && ts.isPrefixUnaryExpression(length) && ts.isNumericLiteral(length.operand)
+      && (length.operator === ts.SyntaxKind.PlusToken || length.operator === ts.SyntaxKind.MinusToken)) {
+      numeric = Number(length.operand.text) * (length.operator === ts.SyntaxKind.MinusToken ? -1 : 1);
+    }
+    // ToLength truncates fractions, clamps negative lengths to zero and caps
+    // positive lengths without allocating any runtime-sized collection.
+    return numeric === undefined ? undefined : Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(numeric)));
+  };
+  const emptyArrayLike = (expression: ts.Expression, env: Environment): boolean => staticArrayLikeLength(expression, env) === 0;
+  const dynamicBatchLength = (expression: ts.Expression, env: Environment): QueueBatch => {
+    if (mutatedCollectionGlobals.has("Object")) return true;
+    const value = collectionExpression(expression, env);
+    if (!value || !ts.isObjectLiteralExpression(value.node) || value.node.properties.length !== 1) return true;
+    const property = value.node.properties[0];
+    return ts.isPropertyAssignment(property) && propertyName(property.name) === "length" ? property.initializer : true;
+  };
+  const arrayFromBatch = (expression: ts.Expression, env: Environment): { batch: QueueBatch; length?: number } => {
+    const value = collectionExpression(expression, env);
+    if (!value || !ts.isCallExpression(value.node) || !ts.isPropertyAccessExpression(value.node.expression)
+      || !nativeGlobal(value.node.expression.expression, "Array") || value.node.expression.name.text !== "from"
+      || !value.node.arguments[0]) return { batch: true };
+    const source = value.node.arguments[0];
+    const shape = arrayElements(source, value.env);
+    const length = shape ? shape.logicalLength ?? shape.items.length : staticArrayLikeLength(source, value.env);
+    return { batch: length !== undefined ? false : dynamicBatchLength(source, value.env), length };
   };
   const promiseResult = (expression: ts.Expression, env: Environment): { state: "fulfilled" | "rejected" | "unknown"; payload: Value[] } => {
     const value = collectionExpression(expression, env);
@@ -2653,7 +2974,8 @@ export function requestReachability(workspace: Workspace): RequestReachability {
           append(initialized, defaults.length ? defaults : [{ node: parameter.initializer, env: inner }]);
           supplied[parameterIndex] = initialized; inner.parameters.set(parameter, initialized);
         }
-        if (schedule) invoke(fn.bound ? { ...fn, bound: undefined } : fn, supplied, request, receiver);
+        if (schedule) invoke(fn.bound ? { ...fn, bound: undefined } : fn, supplied, request, receiver, undefined, false, node, false,
+          !compactDense && indices.length - (hasInitial ? 0 : 1) <= 1);
         if (fn.node.asteriskToken || asynchronous) { accumulator = [{ node, env }]; continue; }
         const returned: Value[] = [];
         if (ts.isBlock(fn.node.body)) {
@@ -2707,31 +3029,181 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       return exits;
     } finally { finishCompletion(frame); activeReductions.delete(node); }
   };
+  const localSyncImplementation = (call: ts.CallExpression, targets: Value[], env: Environment): boolean => {
+    budget.take();
+    const declaration = symbolOf(call.expression)?.valueDeclaration;
+    if (!declaration || assignedImplementations.has(writeDeclaration(declaration)) || writes.has(writeDeclaration(declaration)) || !targets.length
+      || !targets.every(value => { budget.take(); return callable(value.node); })) return false;
+    const implementation = callable(declaration) ? declaration
+      : (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration)) && declaration.initializer
+        && callable(declaration.initializer) ? declaration.initializer : undefined;
+    if (!implementation) return false;
+    if (ts.isIdentifier(call.expression)) return true;
+    if (!ts.isPropertyAccessExpression(call.expression) && !ts.isElementAccessExpression(call.expression)) return false;
+    const owner = collectionExpression(call.expression.expression, env);
+    if (!owner || !ts.isExpression(owner.node)) return false;
+    if (ts.isObjectLiteralExpression(owner.node)) return declaration.parent === owner.node;
+    if (!ts.isCallExpression(owner.node)) return false;
+    const factoryDeclaration = symbolOf(owner.node.expression)?.valueDeclaration ?? definitionOf(owner.node.expression);
+    if (!factoryDeclaration || assignedImplementations.has(writeDeclaration(factoryDeclaration)) || writes.has(writeDeclaration(factoryDeclaration))) return false;
+    const factory = callable(factoryDeclaration) ? factoryDeclaration
+      : ts.isVariableDeclaration(factoryDeclaration) && factoryDeclaration.initializer && callable(factoryDeclaration.initializer)
+        ? factoryDeclaration.initializer : undefined;
+    if (!factory) return false;
+    let returned: ts.Node | undefined = factory.body;
+    if (ts.isBlock(returned)) {
+      if (returned.statements.length !== 1 || !ts.isReturnStatement(returned.statements[0])) return false;
+      returned = returned.statements[0].expression;
+    }
+    while (returned && transparent(returned)) { budget.take(); returned = returned.expression; }
+    // Only an explicitly allocated object establishes ownership here. A type
+    // annotation or an opaque factory return cannot certify a runtime method.
+    return !!returned && ts.isObjectLiteralExpression(returned) && declaration.parent === returned;
+  };
+  const abruptCallbackTails = new WeakMap<ts.Node, boolean>();
+  const abruptCallbackTail = (root: ts.Node): boolean => {
+    const pending = [root];
+    while (pending.length) {
+      budget.take();
+      const node = pending[pending.length - 1];
+      if (abruptCallbackTails.has(node)) { pending.pop(); continue; }
+      let children: ts.Node[] = [];
+      let direct = false;
+      if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) direct = true;
+      else if (ts.isBlock(node) && node.statements.length) children = [node.statements[node.statements.length - 1]];
+      else if (ts.isIfStatement(node)) {
+        const selected = conditionTruth(node.expression, budget);
+        if (selected === true) children = [node.thenStatement];
+        else if (selected === false) children = node.elseStatement ? [node.elseStatement] : [];
+        else if (node.elseStatement) children = [node.thenStatement, node.elseStatement];
+      }
+      else if (ts.isTryStatement(node)) {
+        if (node.finallyBlock && abruptCallbackTails.get(node.finallyBlock) === undefined) { pending.push(node.finallyBlock); continue; }
+        if (node.finallyBlock && abruptCallbackTails.get(node.finallyBlock)) direct = true;
+        else children = node.catchClause ? [node.tryBlock, node.catchClause.block] : [node.tryBlock];
+      }
+      const missing = children.find(child => !abruptCallbackTails.has(child));
+      if (missing) { pending.push(missing); continue; }
+      abruptCallbackTails.set(node, direct || children.length > 0 && children.every(child => abruptCallbackTails.get(child)));
+      pending.pop();
+    }
+    return abruptCallbackTails.get(root)!;
+  };
+  const intrinsicCallbackCompletions = new WeakMap<Callable, boolean | "throw" | null>();
+  /** Only body-intrinsic return values are shared across native invocations.
+   * Argument/receiver-dependent results stay unknown rather than borrowing a
+   * value from another callback binding or an earlier mutable observation. */
+  const intrinsicCallbackCompletion = (fn: Value): boolean | "throw" | undefined => {
+    budget.take();
+    if (!callable(fn.node)) return undefined;
+    if (fn.node.asteriskToken || fn.node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword)) return true;
+    const known = intrinsicCallbackCompletions.get(fn.node);
+    if (known !== undefined) return known ?? undefined;
+    const fixedTruth = (expression: ts.Expression | undefined): boolean | undefined => {
+      if (!expression) return false;
+      const result = conditionTruth(expression, budget);
+      if (result !== undefined) return result;
+      while (transparent(expression)) { budget.take(); expression = expression.expression; }
+      if (ts.isObjectLiteralExpression(expression) || ts.isArrayLiteralExpression(expression)
+        || ts.isFunctionExpression(expression) || ts.isArrowFunction(expression) || ts.isClassExpression(expression)) return true;
+      if (ts.isIdentifier(expression) && expression.text === "undefined" && !symbolOf(expression)?.declarations?.length) return false;
+      return undefined;
+    };
+    let selected: boolean | undefined, observed = false, mixed = false;
+    const include = (value: boolean | undefined): void => {
+      if (value === undefined || observed && value !== selected) mixed = true;
+      selected = value; observed = true;
+    };
+    if (!ts.isBlock(fn.node.body)) include(fixedTruth(fn.node.body));
+    else {
+      const pending: ts.Node[] = [fn.node.body];
+      while (pending.length && !mixed) {
+        budget.take(); const node = pending.pop()!;
+        if (ts.isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node)) continue;
+        if (ts.isReturnStatement(node)) { include(fixedTruth(node.expression)); continue; }
+        if (ts.isBlock(node)) {
+          for (const statement of node.statements) {
+            budget.take(); pending.push(statement);
+            if (abruptCallbackTail(statement)) break;
+          }
+          continue;
+        }
+        if (ts.isIfStatement(node)) {
+          const selected = conditionTruth(node.expression, budget);
+          if (selected !== false) pending.push(node.thenStatement);
+          if (selected !== true && node.elseStatement) pending.push(node.elseStatement);
+          continue;
+        }
+        // An unconditional return/throw in finally replaces every earlier
+        // completion; conditional finally returns retain both alternatives.
+        if (ts.isTryStatement(node) && node.finallyBlock && abruptCallbackTail(node.finallyBlock)) {
+          pending.push(node.finallyBlock); continue;
+        }
+        ts.forEachChild(node, child => { pending.push(child); });
+      }
+      if (!mixed && !abruptCallbackTail(fn.node.body)) include(false);
+    }
+    const result = !mixed && !observed && ts.isBlock(fn.node.body) && abruptCallbackTail(fn.node.body)
+      ? "throw" : mixed ? undefined : selected;
+    intrinsicCallbackCompletions.set(fn.node, result ?? null);
+    return result;
+  };
   const invokeExternalCallbacks = (node: ts.CallExpression | ts.NewExpression, env: Environment, args: Value[][], request: boolean, plans?: WeakMap<ts.Node, ConstructorInvocation[]>): void => {
     const expression = node.expression;
     if (plans) {
       const scheduled = new Set<ConstructorInvocation[]>();
       for (const values of args) for (const value of values) {
         budget.take(); const entries = plans.get(value.node);
-        if (entries && !scheduled.has(entries)) { scheduled.add(entries); invokeConstructorEntries(entries, request); }
+        if (entries && !scheduled.has(entries)) { scheduled.add(entries); invokeConstructorEntries(entries, request, node); }
       }
       if (scheduled.size) return;
     }
     if (ts.isNewExpression(node) && nativeGlobal(expression, "Promise")) {
-      for (const value of args[0] ?? []) { budget.take(); invoke(value, suppliedArguments(value, 2, node), request, undefined); }
+      for (const value of args[0] ?? []) { budget.take(); invoke(value, suppliedArguments(value, 2, node), request, undefined, undefined, false, node); }
       return;
+    }
+    const member = ts.isPropertyAccessExpression(expression) ? expression.name.text
+      : ts.isElementAccessExpression(expression) ? propertyName(expression.argumentExpression) : undefined;
+    if (ts.isCallExpression(node) && args[0]?.length && (ts.isIdentifier(expression)
+      || member === "queueMicrotask" || member === "setImmediate" || member === "nextTick")) {
+      const callbacks = callables(args[0]);
+      const scheduler = callbacks.length && nativeScheduler(expression);
+      if (scheduler) {
+        // A returned Immediate can be cancelled before the next event-loop turn.
+        let result: ts.Node = node;
+        while (transparent(result.parent)) { budget.take(); result = result.parent; }
+        const returnedFromHandler = !!env.fn && queueCallers.get(env.fn)?.has(null)
+          && (ts.isReturnStatement(result.parent) || ts.isArrowFunction(result.parent) && result.parent.body === result);
+        const unusedHandle = scheduler === "setImmediate" && ts.isVariableDeclaration(result.parent)
+          && result.parent.initializer === result && ts.isIdentifier(result.parent.name) && ts.isVariableDeclarationList(result.parent.parent)
+          && !(result.parent.parent.flags & ts.NodeFlags.Using) && !bindingWriteIndex(node.getSourceFile()).references.has(result.parent);
+        const scheduled = scheduler !== "setImmediate" || ts.isExpressionStatement(result.parent)
+          || ts.isVoidExpression(result.parent) || returnedFromHandler || unusedHandle;
+        budget.take(args.length);
+        const payload = scheduler === "queueMicrotask" ? [] : args.slice(1);
+        for (const callback of callbacks) {
+          budget.take(); invoke(callback, payload, scheduled && request, undefined, undefined, true, node, "deferred");
+        }
+        return;
+      }
     }
     if (ts.isPropertyAccessExpression(expression)) {
       if (nativeGlobal(expression.expression, "Array") && expression.name.text === "from") {
         const source = node.arguments?.[0];
         const shape = source && (arrayElements(source, env) ?? (emptyArrayLike(source, env) ? { items: [], holes: [] } : undefined));
         if (shape && shape.items.length === 0) return;
+        const staticLength = shape ? shape.logicalLength ?? shape.items.length : source && staticArrayLikeLength(source, env);
+        const batch = hasQueueProducer && !shape && source && staticLength === undefined
+          ? dynamicBatchLength(source, env) : false;
         const payload: Value[] = [];
         if (shape) for (const values of shape.items) append(payload, values);
         for (const value of args[1] ?? []) {
           budget.take(); const callbackArgs = suppliedArguments(value, 2, node);
           if (shape) callbackArgs[0] = payload;
-          for (const receiver of explicitReceivers(args[2])) { budget.take(); invoke(value, callbackArgs, request, receiver); }
+          for (const receiver of explicitReceivers(args[2])) {
+            budget.take(); invoke(value, callbackArgs, request, receiver, undefined, false, node, batch,
+              staticLength !== undefined && staticLength <= 1);
+          }
         }
         return;
       }
@@ -2741,34 +3213,58 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       const promiseMethod = kind === "promise" && !mutatedCollectionGlobals.has("Promise") && ["then", "catch", "finally"].includes(method);
       if (arrayMethod || promiseMethod) {
         const shape = arrayMethod ? arrayElements(expression.expression, env) : undefined;
+        const inheritedBatch = hasQueueProducer && arrayMethod && !shape ? arrayFromBatch(expression.expression, env) : undefined;
+        const batch = inheritedBatch?.batch ?? false;
         const visitsHoles = ["find", "findIndex"].includes(method);
         const payload: Value[] = [];
+        let present = 0, firstIndex: number | undefined;
         if (shape) for (let index = 0; index < shape.items.length; index++) {
-          budget.take(); if (!shape.holes[index] || visitsHoles) append(payload, shape.items[index]);
+          budget.take();
+          if ((!shape.holes[index] || visitsHoles)
+            && (method !== "sort" || !shape.items[index].length || !shape.items[index].every(value => { budget.take(); return isUndefinedValue(value); }))) {
+            firstIndex ??= index;
+            present++; append(payload, shape.items[index]);
+          }
         }
+        // Compact shapes describe either a repeated dense value or holes.
+        // Otherwise hole-skipping methods count present slots, not .length.
+        const invocations = shape ? shape.logicalLength !== undefined && present > 0 ? shape.logicalLength : present
+          : inheritedBatch?.length;
         const reducing = ["reduce", "reduceRight"].includes(method);
         if (reducing && shape) { invokeReduction(node, env, args, request, shape, method === "reduceRight"); return; }
-        if (shape && (!payload.length || method === "sort" && shape.items.length < 2 || reducing && !node.arguments?.[1] && shape.items.filter((_, index) => { budget.take(); return !shape.holes[index]; }).length < 2)) return;
+        if (shape && (!payload.length || method === "sort" && present < 2 || reducing && !node.arguments?.[1] && shape.items.filter((_, index) => { budget.take(); return !shape.holes[index]; }).length < 2)) return;
         const promise = promiseMethod ? promiseResult(expression.expression, env) : undefined;
         const positions = method === "then" ? promise?.state === "fulfilled" ? [0] : promise?.state === "rejected" ? [1] : [0, 1]
           : method === "catch" && promise?.state === "fulfilled" ? [] : [0];
         const supplied = promiseMethod ? method === "finally" ? 0 : 1 : method === "sort" ? 2 : ["reduce", "reduceRight"].includes(method) ? 4 : 3;
         for (const position of positions) for (const value of args[position] ?? []) {
           budget.take();
+          const completion = arrayMethod && ["some", "every", "find", "findIndex"].includes(method)
+            ? intrinsicCallbackCompletion(value) : undefined;
+          const stops = completion === "throw" || completion === (method !== "every");
           // Native callbacks receive arguments; an unavailable payload is not
           // proof of a missing argument that should execute its default.
           const callbackArgs = suppliedArguments(value, supplied, node);
           if (promiseMethod && supplied && promise?.state !== "unknown") callbackArgs[0] = promise!.payload;
           if (arrayMethod && shape) {
             if (reducing) { callbackArgs[0] = args[1]?.length ? args[1] : payload; callbackArgs[1] = payload; }
-            else { callbackArgs[0] = payload; if (method === "sort") callbackArgs[1] = payload; }
+            else {
+              callbackArgs[0] = stops && firstIndex !== undefined ? shape.items[firstIndex] : payload;
+              if (method === "sort") callbackArgs[1] = payload;
+              else if (stops && firstIndex !== undefined) callbackArgs[1] = callbackIndex(firstIndex);
+            }
           }
           if (arrayMethod && method !== "sort") {
             const container = collectionExpression(expression.expression, env);
             if (container) callbackArgs[reducing ? 3 : 2] = [container];
           }
           const receivers = arrayMethod && !reducing && method !== "sort" ? explicitReceivers(args[1]) : [undefined];
-          for (const receiver of receivers) { budget.take(); invoke(value, callbackArgs, request, receiver, undefined, promiseMethod); }
+          for (const receiver of receivers) {
+            budget.take();
+            // Even a settled promise queues its reaction after the current stack.
+            invoke(value, callbackArgs, request, receiver, undefined, promiseMethod, node, promiseMethod ? "deferred" : stops ? false : batch,
+              promiseMethod || stops || invocations !== undefined && invocations <= 1);
+          }
         }
         return;
       }
@@ -2809,7 +3305,93 @@ export function requestReachability(workspace: Workspace): RequestReachability {
         }
       }
     }
-    for (const value of values) invoke(value, suppliedArguments(value, supplied, node), certainty);
+    for (const value of values) {
+      if (certainty) recordQueueCaller(value.node, null);
+      invoke(value, suppliedArguments(value, supplied, node), certainty);
+    }
+  };
+  const nativeHostAliases = new WeakMap<ts.Declaration, boolean>();
+  const nativeHostObject = (expression: ts.Expression): boolean => {
+    const path = new Set<ts.Declaration>();
+    let result = false;
+    while (true) {
+      budget.take();
+      if (transparent(expression)) { expression = expression.expression; continue; }
+      if (!ts.isIdentifier(expression)) break;
+      if (["global", "globalThis"].includes(expression.text) && !symbolOf(expression)?.declarations?.length) {
+        result = true;
+        break;
+      }
+      const declaration = symbolOf(expression)?.valueDeclaration;
+      if (!declaration || path.has(declaration) || !ts.isVariableDeclaration(declaration) || !declaration.initializer
+        || !ts.isVariableDeclarationList(declaration.parent) || !(declaration.parent.flags & ts.NodeFlags.Const)) break;
+      const known = nativeHostAliases.get(declaration);
+      if (known !== undefined) { result = known; break; }
+      path.add(declaration);
+      expression = declaration.initializer;
+    }
+    for (const declaration of path) { budget.take(); nativeHostAliases.set(declaration, result); }
+    return result;
+  };
+  const nativeHostProperty = (node: ts.PropertyAccessExpression | ts.ElementAccessExpression, name: string): boolean =>
+    (ts.isPropertyAccessExpression(node) ? node.name.text : propertyName(node.argumentExpression)) === name
+    && nativeHostObject(node.expression);
+  const mathMutatorAliases = new WeakMap<ts.Declaration, boolean>();
+  const aliasesNativeMutator = (at: ts.Expression): boolean => {
+    const visited: ts.Declaration[] = [];
+    const seen = new Set<ts.Declaration>();
+    let expression = at;
+    let mutator = false;
+    while (true) {
+      budget.take();
+      if (transparent(expression)) { expression = expression.expression; continue; }
+      if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+        const method = ts.isPropertyAccessExpression(expression) ? expression.name.text : propertyName(expression.argumentExpression);
+        const receiver = expression.expression;
+        mutator = !!method && ["assign", "defineProperty", "defineProperties", "setPrototypeOf", "set", "deleteProperty"].includes(method)
+          && ts.isIdentifier(receiver) && ["Object", "Reflect"].includes(receiver.text) && !symbolOf(receiver)?.declarations?.length;
+        break;
+      }
+      if (!ts.isIdentifier(expression)) break;
+      const declaration = symbolOf(expression)?.valueDeclaration;
+      if (!declaration || seen.has(declaration) || !ts.isVariableDeclaration(declaration) || !declaration.initializer
+        || !ts.isVariableDeclarationList(declaration.parent) || !(declaration.parent.flags & ts.NodeFlags.Const)) break;
+      const known = mathMutatorAliases.get(declaration);
+      if (known !== undefined) { mutator = known; break; }
+      seen.add(declaration);
+      visited.push(declaration);
+      expression = declaration.initializer;
+    }
+    for (const declaration of visited) { budget.take(); mathMutatorAliases.set(declaration, mutator); }
+    return mutator;
+  };
+  const nativeMathAliases = new WeakMap<ts.Declaration, boolean>();
+  const aliasesNativeMath = (at: ts.Expression): boolean => {
+    const visited: ts.Declaration[] = [];
+    const seen = new Set<ts.Declaration>();
+    let expression = at;
+    let math = false;
+    while (true) {
+      budget.take();
+      if (transparent(expression)) { expression = expression.expression; continue; }
+      if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+        math = nativeHostProperty(expression, "Math");
+        break;
+      }
+      if (!ts.isIdentifier(expression)) break;
+      const symbol = symbolOf(expression);
+      if (expression.text === "Math" && (!symbol?.declarations?.length || symbol.flags & ts.SymbolFlags.Assignment)) { math = true; break; }
+      const declaration = symbol?.valueDeclaration;
+      if (!declaration || seen.has(declaration) || !ts.isVariableDeclaration(declaration) || !declaration.initializer
+        || !ts.isVariableDeclarationList(declaration.parent) || !(declaration.parent.flags & ts.NodeFlags.Const)) break;
+      const known = nativeMathAliases.get(declaration);
+      if (known !== undefined) { math = known; break; }
+      seen.add(declaration);
+      visited.push(declaration);
+      expression = declaration.initializer;
+    }
+    for (const declaration of visited) { budget.take(); nativeMathAliases.set(declaration, math); }
+    return math;
   };
   const poisonCollection = (expression: ts.Expression, seen = new Set<ts.Node>()): void => {
     budget.take(); if (seen.has(expression)) return;
@@ -2818,13 +3400,19 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     mutatedCollections.add(expression);
     if (transparent(expression)) { poisonCollection(expression.expression, next); return; }
     if (ts.isIdentifier(expression)) {
-      if (["Array", "Promise", "Object"].includes(expression.text) && !symbolOf(expression)?.declarations?.length) mutatedCollectionGlobals.add(expression.text);
+      const symbol = symbolOf(expression);
+      if (["Array", "Promise", "Object", "Math", "Function", "String"].includes(expression.text)
+        && (!symbol?.declarations?.length || expression.text === "Math" && !!(symbol.flags & ts.SymbolFlags.Assignment))) mutatedCollectionGlobals.add(expression.text);
       const declaration = definitionOf(expression) ?? symbolOf(expression)?.valueDeclaration ?? symbolOf(expression)?.declarations?.[0];
       if (declaration) {
         mutatedCollections.add(declaration);
         if (ts.isVariableDeclaration(declaration) && declaration.initializer) poisonCollection(declaration.initializer, next);
       }
-    } else if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) poisonCollection(expression.expression, next);
+    } else if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+      if (nativeHostProperty(expression, "Math")) mutatedCollectionGlobals.add("Math");
+      if (nativeHostProperty(expression, "String")) mutatedCollectionGlobals.add("String");
+      poisonCollection(expression.expression, next);
+    }
   };
   const reshapeCollection = (expression: ts.Expression, seen = new Set<ts.Node>()): void => {
     budget.take(); if (seen.has(expression)) return;
@@ -2864,6 +3452,32 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     }
     return undefined;
   };
+  const markAssignedImplementation = (target: ts.Node): void => {
+    const pending = [target];
+    while (pending.length) {
+      budget.take(); const current = pending.pop()!;
+      if (transparent(current)) pending.push(current.expression);
+      else if (ts.isObjectLiteralExpression(current)) {
+        for (const property of current.properties) {
+          budget.take();
+          if (ts.isShorthandPropertyAssignment(property)) pending.push(property.name);
+          else if (ts.isPropertyAssignment(property)) pending.push(property.initializer);
+          else if (ts.isSpreadAssignment(property)) pending.push(property.expression);
+        }
+      } else if (ts.isArrayLiteralExpression(current)) {
+        for (const element of current.elements) { budget.take(); pending.push(element); }
+      } else if (ts.isSpreadElement(current)) pending.push(current.expression);
+      else if (ts.isBinaryExpression(current) && current.operatorToken.kind === ts.SyntaxKind.EqualsToken) pending.push(current.left);
+      else {
+        const declaration = symbolOf(current)?.valueDeclaration;
+        if (declaration) assignedImplementations.add(writeDeclaration(declaration));
+        if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+          if (nativeHostProperty(current, "Math")) mutatedCollectionGlobals.add("Math");
+          poisonCollection(current.expression);
+        } else if (ts.isIdentifier(current) && current.text === "Math") poisonCollection(current);
+      }
+    }
+  };
   for (const { sf } of workspace.units) {
     const pending: ts.Node[] = [sf];
     while (pending.length) {
@@ -2871,12 +3485,17 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       const assignment = ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment;
       const target = assignment ? node.left : ts.isDeleteExpression(node) ? node.expression
         : (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator) ? node.operand : undefined;
-      if (target && (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target))) poisonCollection(target.expression);
+      if (target) markAssignedImplementation(target);
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
         && ["push", "pop", "splice", "shift", "unshift", "copyWithin", "fill"].includes(node.expression.name.text)) reshapeCollection(node.expression.expression);
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && ["assign", "defineProperty", "defineProperties", "setPrototypeOf"].includes(node.expression.name.text)
         && ts.isIdentifier(node.expression.expression) && ["Object", "Reflect"].includes(node.expression.expression.text)
         && !symbolOf(node.expression.expression)?.declarations?.length && node.arguments[0]) poisonCollection(node.arguments[0]);
+      if (ts.isCallExpression(node) && node.arguments[0]
+        && ts.isIdentifier(node.expression) && aliasesNativeMutator(node.expression)) {
+        if (!mutatedCollectionGlobals.has("Math") && aliasesNativeMath(node.arguments[0])) mutatedCollectionGlobals.add("Math");
+        poisonCollection(node.arguments[0]);
+      }
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const key = ts.isPropertyAccessExpression(node.left) ? node.left.name.text : ts.isElementAccessExpression(node.left) ? propertyName(node.left.argumentExpression) : undefined;
         const rawDeclaration = symbolOf(node.left)?.valueDeclaration ?? (key !== undefined && (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))
@@ -2916,6 +3535,28 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     if (ts.isVariableDeclaration(node) && node.initializer && callable(node.initializer)) return node.initializer;
     return undefined;
   };
+  const queueBindings = new WeakMap<ts.Symbol, boolean>();
+  const privateArray = (expression: ts.Expression): boolean => {
+    if (!ts.isIdentifier(expression)) return false;
+    const symbol = symbolOf(expression);
+    if (!symbol) return false;
+    const known = queueBindings.get(symbol);
+    if (known !== undefined) return known;
+    const declaration = symbol.valueDeclaration;
+    let result = false;
+    if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer
+      && ts.isVariableDeclarationList(declaration.parent) && declaration.parent.flags & ts.NodeFlags.Const) {
+      const statement = declaration.parent.parent;
+      if (ts.isVariableStatement(statement) && ts.isSourceFile(statement.parent)
+        && !statement.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+        let initializer = declaration.initializer;
+        while (transparent(initializer)) { budget.take(); initializer = initializer.expression; }
+        result = ts.isArrayLiteralExpression(initializer) && initializer.elements.length === 0;
+      }
+    }
+    queueBindings.set(symbol, result);
+    return result;
+  };
   for (const { sf } of workspace.units) {
     const pending: ts.Node[] = [sf];
     while (pending.length) {
@@ -2925,6 +3566,10 @@ export function requestReachability(workspace: Workspace): RequestReachability {
         const owner = enclosing(node);
         const expression = node.expression;
         const method = ts.isPropertyAccessExpression(expression) ? expression.name.text : undefined;
+        if (!hasQueueProducer && owner && ts.isCallExpression(node) && method === "push"
+          && ts.isPropertyAccessExpression(expression) && privateArray(expression.expression)) {
+          hasQueueProducer = true;
+        }
         const registration = !!owner && (nativeFactory(expression)
           || !!method && ROUTE_METHODS.has(method) && routeReceiver(expression, empty)
           || !!method && ["on", "once", "addListener"].includes(method) && !!node.arguments?.[0] && ts.isStringLiteralLike(node.arguments[0]) && node.arguments[0].text === "request");
@@ -3000,8 +3645,16 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       }
     }
   };
-  const consumerSafety = new WeakMap<Callable, Map<ts.ParameterDeclaration, boolean>>();
-  const accumulatorConsumerSafety = new WeakMap<Callable, Map<ts.ParameterDeclaration, boolean>>();
+  const consumerSafety = new WeakMap<Callable, Map<ts.ParameterDeclaration, CompletionSummary<boolean>>>();
+  const accumulatorConsumerSafety = new WeakMap<Callable, Map<ts.ParameterDeclaration, CompletionSummary<boolean>>>();
+  const activeConsumerQueries = new WeakMap<Map<ts.ParameterDeclaration, CompletionSummary<boolean>>, Set<ts.ParameterDeclaration>>();
+  const consumerFrames: CompletionFrame[] = [];
+  let consumerCycles = 0;
+  const consumerDepth = (depth: number): void => {
+    if (depth > 128) throw new AnalysisLimitError("Request binding resolution depth limit exceeded");
+    const frame = consumerFrames.at(-1);
+    if (frame) frame.max = Math.max(frame.max, depth);
+  };
   const consumerReferences = new WeakMap<Callable, Map<ts.Declaration, ts.Identifier[]>>();
   const referencesFor = (fn: Callable): Map<ts.Declaration, ts.Identifier[]> => {
     const known = consumerReferences.get(fn); if (known) return known;
@@ -3038,15 +3691,22 @@ export function requestReachability(workspace: Workspace): RequestReachability {
     receiverSafety.set(fn, true); return true;
   };
   const readsOnly = (fn: Callable, parameter: ts.ParameterDeclaration, depth = 0, unchangedReturn = false): boolean => {
-    budget.take(); if (depth > 128) throw new AnalysisLimitError("Request binding resolution depth limit exceeded");
+    budget.take(); consumerDepth(depth);
     const cache = unchangedReturn ? accumulatorConsumerSafety : consumerSafety;
-    const known = cache.get(fn) ?? new Map<ts.ParameterDeclaration, boolean>();
-    if (known.has(parameter)) return known.get(parameter)!;
-    known.set(parameter, false); cache.set(fn, known);
+    const known = cache.get(fn) ?? new Map<ts.ParameterDeclaration, CompletionSummary<boolean>>();
+    const summary = known.get(parameter);
+    if (summary) { consumerDepth(depth + summary.height); return summary.value; }
+    cache.set(fn, known);
+    const queries = activeConsumerQueries.get(known) ?? new Set<ts.ParameterDeclaration>();
+    if (queries.has(parameter)) { consumerCycles++; return false; }
+    queries.add(parameter); activeConsumerQueries.set(known, queries);
+    const frame = { start: depth, max: depth }, cycles = consumerCycles;
+    consumerFrames.push(frame);
+    try {
     const references = referencesFor(fn);
     const active = new Set<ts.Declaration>();
     const safeBinding = (binding: ts.Declaration, aliasDepth = depth): boolean => {
-      if (aliasDepth > 128) throw new AnalysisLimitError("Request binding resolution depth limit exceeded");
+      consumerDepth(aliasDepth);
       budget.take(); if (active.has(binding)) return false;
       active.add(binding);
       try {
@@ -3083,8 +3743,16 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       return true;
       } finally { active.delete(binding); }
     };
-    if (!safeBinding(parameter)) return false;
-    known.set(parameter, true); return true;
+    const safe = safeBinding(parameter);
+    // A cycle's conservative false depends on the active path. Completed
+    // acyclic failures still retain the depth required to establish them.
+    if (cycles === consumerCycles) known.set(parameter, { value: safe, height: frame.max - frame.start });
+    return safe;
+    } finally {
+      queries.delete(parameter); consumerFrames.pop();
+      const parent = consumerFrames.at(-1);
+      if (parent) parent.max = Math.max(parent.max, frame.max);
+    }
   };
   const reducerArgumentsSafety = new WeakMap<Callable, boolean>();
   const observesInvocationArguments = (fn: Callable): boolean => {
@@ -3220,6 +3888,7 @@ export function requestReachability(workspace: Workspace): RequestReachability {
         if (signature && exported && /(^|\/)(app|pages|api|routes?)(\/|\.)/i.test(rel) || verb || nest) {
           const entry = { node, env: empty };
           const supplied = nest ? node.parameters.length : verb || /(^|\/)pages\//i.test(rel) ? 2 : 3;
+          recordQueueCaller(node, null);
           invoke(entry, suppliedArguments(entry, supplied, node), true, nest && (ts.isClassDeclaration(node.parent) || ts.isClassExpression(node.parent)) ? { node: node.parent, env: empty } : undefined);
         }
         // A private, uncalled server factory is not evidence of a request
@@ -3260,6 +3929,14 @@ export function requestReachability(workspace: Workspace): RequestReachability {
         roots(node, task.env);
         if (ts.isCallExpression(node) && task.request !== undefined) evidence.set(node, !!evidence.get(node) || task.request);
         const targets = resolve(node.expression, task.env, node.expression, new Set(), task.request !== undefined);
+        if (ts.isCallExpression(node)) {
+          const name = ts.isIdentifier(node.expression) ? node.expression.text
+            : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : undefined;
+          if (name?.endsWith("Sync")) {
+            const local = localSyncImplementations.get(node) !== false && localSyncImplementation(node, targets, task.env);
+            localSyncImplementations.set(node, local);
+          }
+        }
         let functions = callables(targets);
         let args = (node.arguments ?? []).map(argument => resolve(argument, task.env, argument, new Set(), task.request !== undefined));
         let receiver = receiverOf(node.expression, task.env, new Set(), task.request !== undefined);
@@ -3269,6 +3946,12 @@ export function requestReachability(workspace: Workspace): RequestReachability {
           const method = ts.isPropertyAccessExpression(node.expression) ? node.expression.name.text : propertyName(node.expression.argumentExpression);
           if (method === "call" || method === "bind") {
             const originals = nativeCallableMember(node.expression, task.env);
+            if (method === "call" && hasQueueProducer && task.request === true
+              && node.arguments.length === 1 && node.arguments[0].kind === ts.SyntaxKind.NullKeyword) {
+              const previous = nativeQueueCalls.get(node);
+              const native = previous !== false && originals.length > 0 && !mutatedCollectionGlobals.has("Function");
+              if (native !== previous) { budget.take(); nativeQueueCalls.set(node, native); }
+            }
             if (originals.length) {
               knownHelper = true;
               functions = method === "call" ? originals : [];
@@ -3282,11 +3965,11 @@ export function requestReachability(workspace: Workspace): RequestReachability {
           const paired = !knownHelper && (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression)) ? fn.memberReceiver ?? receiver : receiver;
           const entries = permitted?.targets.get(node)?.get(fn.node);
           if (entries) {
-            if (!scheduledPlans.has(entries)) { scheduledPlans.add(entries); invokeConstructorEntries(entries, task.request); }
+            if (!scheduledPlans.has(entries)) { scheduledPlans.add(entries); invokeConstructorEntries(entries, task.request, node); }
             continue;
           }
-          if (callReceivers) for (const target of callReceivers) { budget.take(); invoke(fn, args, task.request, target); }
-          else invoke(fn, args, task.request, paired);
+          if (callReceivers) for (const target of callReceivers) { budget.take(); invoke(fn, args, task.request, target, undefined, false, node); }
+          else invoke(fn, args, task.request, paired, undefined, false, node);
         }
         let constructor = false;
         if (ts.isNewExpression(node)) for (const target of targets) {
@@ -3321,5 +4004,12 @@ export function requestReachability(workspace: Workspace): RequestReachability {
       for (const [owner, state] of previousInitializations) { budget.take(); activeInitializations.set(owner, state); }
     }
   }
-  return { evidence: node => evidence.has(node) ? evidence.get(node) ? "request" : "possible" : undefined };
+  return {
+    evidence: node => evidence.has(node) ? evidence.get(node) ? "request" : "possible" : undefined,
+    queueCallers: target => queueCallers.get(target),
+    unitQueueCaller: (target, site) => !repeatedQueueCallers.get(target)?.has(site),
+    nativeQueueCall: site => nativeQueueCalls.get(site) === true,
+    nativeMathUnchanged: () => !mutatedCollectionGlobals.has("Math"),
+    localSyncImplementation: node => localSyncImplementations.get(node) === true,
+  };
 }

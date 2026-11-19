@@ -3,6 +3,8 @@ import ts from "typescript";
 import type { Finding } from "../types.js";
 import type { FileContext } from "../context.js";
 import { lastSegment } from "../context.js";
+import { bindingWriteIndex, currentImportedBinding, currentInitializer, symbolOf } from "../bindings.js";
+import { staticExpression } from "../staticValues.js";
 
 export async function listSourceFiles(root: string): Promise<string[]> {
   const ignoredDirs = new Set([
@@ -57,11 +59,18 @@ export function lineOf(sf: ts.SourceFile, node: ts.Node): number {
   return sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
 }
 
-export function snippetAt(content: string, line: number, radius = 1): string {
-  const lines = content.split("\n");
-  const start = Math.max(0, line - 1 - radius);
-  const end = Math.min(lines.length, line + radius);
-  return lines.slice(start, end).join("\n").slice(0, 500);
+export function locationOf(sf: ts.SourceFile, node: ts.Node): { line: number; column: number } {
+  const { line, character } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+  return { line: line + 1, column: character + 1 };
+}
+
+/** Reuse the parser's line offsets when extracting many findings from one file. */
+export function sourceSnippetAt(source: ts.SourceFile, line: number): string {
+  const starts = source.getLineStarts();
+  const start = starts[Math.max(0, line - 2)];
+  const next = starts[line + 1];
+  const end = next === undefined ? source.text.length : next - 1;
+  return source.text.slice(start, Math.min(end, start + 500));
 }
 
 export function makeFinding(partial: Omit<Finding, "snippet"> & { snippet?: string }): Finding {
@@ -127,6 +136,22 @@ export const DB_WRITE_RECEIVER = /(^|\.)(prisma|db|database|redis|redisClient|kn
  */
 const NON_DATA_RECEIVER = /(Service|Controller|Resolver|Helper|Helpers|Util|Utils|Factory|Builder|Validator|Mapper|Serializer|Presenter|Formatter|Provider|Handler|Middleware|Guard|Strategy|Pipeline)$/;
 
+const postgresAllocations = new WeakMap<ts.Node, boolean>();
+
+/** A Pool or Client remains a database receiver under application-specific names. */
+export function isPostgresClient(receiver: ts.Expression): boolean {
+  const declaration = ts.isIdentifier(receiver) ? symbolOf(receiver)?.valueDeclaration : undefined;
+  const captured = declaration && ts.isVariableDeclaration(declaration) ? currentInitializer(declaration, receiver) : receiver;
+  if (!captured) return false;
+  const known = postgresAllocations.get(captured);
+  if (known !== undefined) return known;
+  const value = staticExpression(captured, new Set(), bindingWriteIndex(captured.getSourceFile()).budget);
+  const imported = value && ts.isNewExpression(value) ? currentImportedBinding(value.expression) : null;
+  const postgres = imported?.module === "pg" && (imported.name === "Pool" || imported.name === "Client");
+  postgresAllocations.set(captured, postgres);
+  return postgres;
+}
+
 /**
  * True when the call is a database read.
  *
@@ -154,6 +179,8 @@ export function isOrmCall(node: ts.CallExpression, ctx?: FileContext): boolean {
   // Array helpers take a callback as first argument; ORM reads never do.
   const first = node.arguments[0];
   if (first && (ts.isArrowFunction(first) || ts.isFunctionExpression(first))) return false;
+
+  if (methodName === "query" && isPostgresClient(node.expression.expression)) return true;
 
   // `UserService.find()` and friends are not database reads.
   if (NON_DATA_RECEIVER.test(receiver)) return false;
@@ -207,8 +234,9 @@ export function isKnownModel(receiver: string, ctx: FileContext): boolean {
 
 export function asObjectLiteral(expr: ts.Expression): ts.ObjectLiteralExpression | null {
   let val = expr;
-  while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val) || ts.isNonNullExpression(val)) {
-    val = (val as any).expression;
+  while (ts.isAsExpression(val) || ts.isParenthesizedExpression(val) || ts.isTypeAssertionExpression(val)
+    || ts.isNonNullExpression(val) || ts.isSatisfiesExpression(val)) {
+    val = val.expression;
   }
   return ts.isObjectLiteralExpression(val) ? val : null;
 }

@@ -14,16 +14,16 @@ import { detectFloatingPromises } from "./detectors/floatingPromise.js";
 import { detectSequentialAwaits } from "./detectors/sequentialAwait.js";
 import { detectPerRequestClients } from "./detectors/perRequestClient.js";
 import { detectReliability } from "./detectors/reliability.js";
+import { detectQueueBackpressure } from "./detectors/queueBackpressure.js";
 import type { Fingerprint, Finding, Report, DetectorStatus } from "./types.js";
 import { Workspace } from "./workspace.js";
-import { planCodemod, renderDiff, applyPlan } from "./codemod.js";
+import { planCodemod, renderDiff, applyPlan, hasHttpEditCandidate } from "./codemod.js";
 import { scoreFindings, interpretScore, type AuditOptions } from "./scoring.js";
 import { assertSupportedNode } from "./runtime.js";
+import { mergeFindings, SEVERITY_RANK } from "./findings.js";
 
 // Read our installed package metadata, never the audited project's code.
 const analyzerPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
-
-const SEVERITY_RANK: Record<Finding["severity"], number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
 /**
  * Detectors that need the parsed workspace. They all share one parse pass,
@@ -42,6 +42,7 @@ const DETECTORS = [
   detectSequentialAwaits,
   detectPerRequestClients,
   detectReliability,
+  detectQueueBackpressure,
 ] as const;
 
 export async function runAudit(input: string, options: AuditOptions = {}): Promise<Report> {
@@ -51,12 +52,12 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     const fingerprint = await fingerprintRepo(root, sourceFile);
     const ws = await Workspace.load(root, sourceFile);
 
-    const findings: Finding[] = [];
+    const findingGroups: Finding[][] = [];
     // Invoke inside promises so synchronous throws are isolated too.
     const results = await Promise.allSettled(DETECTORS.map(d => Promise.resolve().then(() => d(root, ws))));
     const detectors: DetectorStatus[] = results.map((result, index) => {
       if (result.status === "fulfilled") {
-        findings.push(...result.value);
+        findingGroups.push(result.value);
         return { name: DETECTORS[index].name, status: "complete" };
       }
       // Never expose arbitrary exception text (paths/credentials) in HTTP reports.
@@ -67,13 +68,10 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     const complete = detectors.every(d => d.status === "complete") && ws.coverage.skipped.length === 0 && ws.coverage.analyzed > 0;
 
     // Dependency-presence advisories are not vulnerability findings.
-    findings.push(...dependencySignals(fingerprint));
+    findingGroups.push(dependencySignals(fingerprint));
+    const findings = mergeFindings(findingGroups);
 
-    const deduped = dedupeFindings(findings);
-    findings.length = 0;
-    findings.push(...deduped);
-
-    findings.sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+    findings.sort((a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity]);
 
     const { score, categories } = scoreFindings(findings);
 
@@ -123,7 +121,17 @@ export async function runAudit(input: string, options: AuditOptions = {}): Promi
     };
 
     if (options.codemod) {
-      const plan = planCodemod(root, findings);
+      let context = ws, httpContextComplete = !sourceFile && complete;
+      if (sourceFile && complete && ws.units[0] && hasHttpEditCandidate(ws.units[0].sf, findings)) {
+        // An entry outside a one-file audit can configure a shared HTTP
+        // client. Read bounded context only for planning, and edit only the
+        // selected findings. Detector scope and reported coverage stay local.
+        try {
+          context = await Workspace.load(root, undefined, ws);
+          httpContextComplete = !context.coverage.skipped.length && context.units.some(unit => unit.rel === sourceFile);
+        } catch { httpContextComplete = false; }
+      }
+      const plan = planCodemod(root, findings, context.units.map(unit => unit.sf), httpContextComplete);
       const written = options.codemod === "apply" && complete ? applyPlan(root, plan) : [];
       report.codemod = {
         diff: renderDiff(plan),
@@ -153,23 +161,6 @@ function buildSummary(findings: Finding[], categories: ReturnType<typeof scoreFi
     byConfidence[f.confidence] = (byConfidence[f.confidence] ?? 0) + 1;
   }
   return { total: findings.length, bySeverity, byCategory, byConfidence, categories };
-}
-
-function dedupeFindings(findings: Finding[]): Finding[] {
-  const seen = new Set<string>();
-  const exact: Finding[] = [];
-  for (const f of findings) {
-    const key = `${f.id}|${f.file}|${f.line}|${f.message}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    exact.push(f);
-  }
-  // An N+1 includes the underlying read; suppress the duplicate unbounded-read at the same spot.
-  const n1 = exact.filter((f) => f.id === "n-plus-one");
-  return exact.filter((f) => {
-    if (f.id !== "unbounded-read") return true;
-    return !n1.some((n) => n.file === f.file && n.line === f.line);
-  });
 }
 
 function dependencySignals(fp: Fingerprint): Finding[] {

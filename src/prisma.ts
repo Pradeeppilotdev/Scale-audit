@@ -7,6 +7,7 @@ export interface PrismaModel {
   indexed: Set<string>;
   /** Scalar schema fields, used to distinguish filters from relation objects. */
   scalarFields?: Set<string>;
+  nullableScalarFields?: Set<string>;
 }
 
 export interface SchemaGroups {
@@ -55,29 +56,67 @@ export function schemaModelNames(groups: SchemaGroups): Set<string> {
   return new Set(groups.global.keys());
 }
 
+/** Consume each literal/comment once, including malformed unterminated strings.
+ * A combined regex can retry every escaped quote and do quadratic work. */
+function maskSchemaLiterals(content: string): string {
+  const pieces: string[] = [];
+  let position = 0, copied = 0;
+  while (position < content.length) {
+    const start = position;
+    if (content[position] === '"') {
+      position++;
+      while (position < content.length) {
+        const character = content[position++];
+        if (character === "\\") position = Math.min(position + 1, content.length);
+        else if (character === '"') break;
+      }
+    } else if (content.startsWith("//", position)) {
+      const end = content.indexOf("\n", position + 2);
+      position = end < 0 ? content.length : end;
+    } else if (content.startsWith("/*", position)) {
+      const end = content.indexOf("*/", position + 2);
+      position = end < 0 ? content.length : end + 2;
+    } else { position++; continue; }
+    pieces.push(content.slice(copied, start), content.slice(start, position).replace(/[^\n]/g, " "));
+    copied = position;
+  }
+  pieces.push(content.slice(copied));
+  return pieces.join("");
+}
+
 export function parseModels(content: string): Map<string, PrismaModel> {
   const models = new Map<string, PrismaModel>();
-  const blocks = [...content.matchAll(/model\s+(\w+)\s*\{([\s\S]*?)\n\}/g)];
+  // Attribute spellings in comments or string defaults are not schema indexes.
+  // Preserve newlines so each real field retains its declaration boundary.
+  const clean = maskSchemaLiterals(content);
+  const blocks = clean.matchAll(/\bmodel\s+(\w+)\s*\{([^{}]*)\}/g);
   for (const [, name, body] of blocks) {
     const indexed = new Set<string>();
     const scalarFields = new Set<string>();
+    const nullableScalarFields = new Set<string>();
     for (const line of body.split("\n")) {
       const trimmed = line.trim();
-      const field = /^(\w+)\s+(?:String|Int|BigInt|Float|Decimal|Boolean|DateTime|Bytes|Json)(?:[?\[\]]*)\b/.exec(trimmed);
-      if (field) scalarFields.add(field[1]);
+      const field = /^(\w+)\s+(?:String|Int|BigInt|Float|Decimal|Boolean|DateTime|Bytes|Json)(\?|\[\])?(?=\s|$)/.exec(trimmed);
+      if (field) {
+        scalarFields.add(field[1]);
+        if (field[2] === "?") nullableScalarFields.add(field[1]);
+      }
       const idm = trimmed.match(/^(\w+)\s+\w+.*@id\b/);
       if (idm) indexed.add(idm[1]);
       const unm = trimmed.match(/^(\w+)\s+\w+.*@unique\b/);
       if (unm) indexed.add(unm[1]);
-      const blockIdx = trimmed.match(/@@(?:index|unique)\(\s*\[([^\]]+)\]/);
-      if (blockIdx) {
-        // A composite index @@index([a, b]) only serves a single-column filter on
-        // `a` (the leading column). A filter on `b` alone still needs its own index.
-        const fields = blockIdx[1].split(",").map((f) => f.trim().split(/\s/)[0]).filter(Boolean);
-        if (fields.length > 0) indexed.add(fields[0]);
-      }
     }
-    models.set(name.toLowerCase(), { name, indexed, scalarFields });
+    const indexes = /@@(?:id|index|unique)\s*\(\s*\[/g;
+    for (let match = indexes.exec(body); match; match = indexes.exec(body)) {
+      const end = body.indexOf("]", indexes.lastIndex);
+      if (end < 0) break;
+      // Only the leading column serves a standalone single-column filter.
+      // Field arguments (sort/length/ops) do not form part of its name.
+      const first = /^\s*(\w+)/.exec(body.slice(indexes.lastIndex, end));
+      if (first) indexed.add(first[1]);
+      indexes.lastIndex = end + 1;
+    }
+    models.set(name.toLowerCase(), { name, indexed, scalarFields, nullableScalarFields });
   }
   return models;
 }
@@ -85,10 +124,12 @@ export function parseModels(content: string): Map<string, PrismaModel> {
 export function mergeModel(target: Map<string, PrismaModel>, key: string, model: PrismaModel): void {
   const existing = target.get(key);
   if (!existing) {
-    target.set(key, { name: model.name, indexed: new Set(model.indexed), scalarFields: new Set(model.scalarFields) });
+    target.set(key, { name: model.name, indexed: new Set(model.indexed), scalarFields: new Set(model.scalarFields),
+      nullableScalarFields: new Set(model.nullableScalarFields) });
     return;
   }
   for (const field of model.scalarFields ?? []) existing.scalarFields?.add(field);
+  for (const field of model.nullableScalarFields ?? []) existing.nullableScalarFields?.add(field);
   for (const field of model.indexed) existing.indexed.add(field);
 }
 

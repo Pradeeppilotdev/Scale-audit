@@ -1,5 +1,5 @@
-import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
-import { definitionOf, isHttpFetch, symbolOf } from "./bindings.js";
+import { bindingWriteIndex, currentInitializer, definitionOf, exportedEntry, isHttpFetch, precedingInitializer, statementList, symbolOf, type BindingWrite } from "./bindings.js";
+export { currentInitializer } from "./bindings.js";
 import ts from "typescript";
 import type { FileContext } from "./context.js";
 import { DB_WRITE_RECEIVER } from "./detectors/common.js";
@@ -38,6 +38,14 @@ export const DB_WRITE_METHODS = new Set([
 /** Calls that return a promise and are commonly left unawaited. */
 export const PROMISE_CALL_NAMES = new Set([...DB_WRITE_METHODS, "fetch"]);
 
+function member(node: ts.Expression): { receiver: ts.Expression; name: string } | undefined {
+  if (ts.isPropertyAccessExpression(node)) return { receiver: node.expression, name: node.name.text };
+  if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)) {
+    return { receiver: node.expression, name: node.argumentExpression.text };
+  }
+  return undefined;
+}
+
 /**
  * True when the call is a database write we are confident about.
  *
@@ -47,10 +55,9 @@ export const PROMISE_CALL_NAMES = new Set([...DB_WRITE_METHODS, "fetch"]);
  * have evidence for.
  */
 export function isDbWriteCall(node: ts.CallExpression, ctx?: FileContext): boolean {
-  if (!ts.isPropertyAccessExpression(node.expression)) return false;
-  const method = node.expression.name.getText();
-  if (!DB_WRITE_METHODS.has(method)) return false;
-  const receiver = node.expression.expression.getText();
+  const target = member(node.expression);
+  if (!target || !DB_WRITE_METHODS.has(target.name)) return false;
+  const receiver = target.receiver.getText();
   if (DB_WRITE_RECEIVER.test(receiver)) return true;
   if (ctx && isKnownModel(receiver, ctx)) return true;
   return false;
@@ -63,8 +70,9 @@ export function isPromiseProducingCall(node: ts.CallExpression, ctx?: FileContex
     // `fetch` always returns a promise.
     return isHttpFetch(node.expression);
   }
-  if (!ts.isPropertyAccessExpression(node.expression)) return false;
-  const method = node.expression.name.getText();
+  const target = member(node.expression);
+  if (!target) return false;
+  const method = target.name;
   if (method === "then" || method === "catch" || method === "finally") return false;
   if (method === "fetch") return isHttpFetch(node.expression);
   if (PROMISE_CALL_NAMES.has(method)) return isDbWriteCall(node, ctx);
@@ -77,7 +85,8 @@ export function isPromiseProducingCall(node: ts.CallExpression, ctx?: FileContex
  */
 export function isFloatingPromise(stmt: ts.Statement, ctx?: FileContext): ts.CallExpression | null {
   if (!ts.isExpressionStatement(stmt)) return null;
-  const expr = stmt.expression;
+  let expr = stmt.expression;
+  while (transparent(expr)) expr = expr.expression;
   if (!ts.isCallExpression(expr)) return null;
   if (!isPromiseProducingCall(expr, ctx)) return null;
 
@@ -99,125 +108,155 @@ export function isFloatingPromise(stmt: ts.Statement, ctx?: FileContext): ts.Cal
   return expr;
 }
 
-interface BindingWrite { node: ts.Node; value?: ts.Expression }
-interface WriteIndex { writes: Map<ts.Declaration, BindingWrite[]>; references: Set<ts.Declaration>; budget: AnalysisBudget }
-const bindingWrites = new WeakMap<ts.SourceFile, WriteIndex>();
+function transparent(node: ts.Node): node is ts.ParenthesizedExpression | ts.AsExpression | ts.NonNullExpression
+  | ts.SatisfiesExpression | ts.TypeAssertion {
+  return ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)
+    || ts.isSatisfiesExpression(node) || ts.isTypeAssertionExpression(node);
+}
 
 function directDefinition(node: ts.Node): ts.Declaration | undefined {
-  const direct = symbolOf(node)?.valueDeclaration;
+  // The checker attaches literal computed-member identity to the key node.
+  const key = ts.isElementAccessExpression(node) && (ts.isStringLiteralLike(node.argumentExpression)
+    || ts.isNumericLiteral(node.argumentExpression)) ? node.argumentExpression : node;
+  const direct = symbolOf(key)?.valueDeclaration;
   // Keep local aliases as bindings so their own assignments cannot disappear.
   return direct && (ts.isVariableDeclaration(direct) || ts.isParameter(direct) || ts.isPropertyAssignment(direct) || ts.isPropertyDeclaration(direct)) ? direct : definitionOf(node);
 }
 
-function statementList(node: ts.Node): ts.Block | ts.SourceFile | undefined {
-  for (let parent = node.parent; parent; parent = parent.parent) if (ts.isBlock(parent) || ts.isSourceFile(parent)) return parent;
-  return undefined;
+const initializerReads = new WeakMap<ts.Declaration, WeakMap<ts.Node, ts.Expression | null>>();
+interface PropertyHistories {
+  unknown: boolean;
+  receivers: Map<ts.Node, BindingWrite[]>;
+  checked: Map<ts.Node, { list: ts.Node | undefined; entries?: BindingWrite[] }>;
+}
+const propertyHistories = new WeakMap<ts.Declaration, PropertyHistories>();
+const independentInstances = new WeakMap<ts.ClassLikeDeclaration, boolean>();
+const classWriteHistories = new WeakMap<ts.ClassDeclaration, { list?: ts.Node; first: number }>();
+
+function unchangedClassBinding(declaration: ts.ClassDeclaration, use: ts.Node): boolean {
+  const sf = declaration.getSourceFile(), index = bindingWriteIndex(sf), writes = index.writes.get(declaration);
+  if (!writes?.length) return true;
+  let history = classWriteHistories.get(declaration);
+  if (!history) {
+    const list = statementList(declaration);
+    const ordered = !!list && writes.every(write => {
+      index.budget.take();
+      return ts.isExpressionStatement(write.node.parent) && write.node.parent.parent === list && !!write.value;
+    });
+    history = { list: ordered ? list : undefined, first: writes[0].node.end };
+    classWriteHistories.set(declaration, history);
+  }
+  // A capture before a later straight-line reassignment still owns the old
+  // constructor. A changed or ambiguously timed binding proves no allocation.
+  return sf === use.getSourceFile() && !!history.list && statementList(use) === history.list && use.pos <= history.first;
 }
 
-function writeIndex(sf: ts.SourceFile): WriteIndex {
-  const cached = bindingWrites.get(sf); if (cached) return cached;
-  const result: WriteIndex = { writes: new Map(), references: new Set(), budget: new AnalysisBudget("Promise binding writes", projectWorkLimit([sf])) };
-  const add = (target: ts.Node, node: ts.Node, value?: ts.Expression): void => {
-    result.budget.take();
-    if (ts.isIdentifier(target)) {
-      const declaration = symbolOf(target)?.valueDeclaration;
-      if (declaration) { const entries = result.writes.get(declaration) ?? []; entries.push({ node, value }); result.writes.set(declaration, entries); }
-    } else if (ts.isPropertyAccessExpression(target)) {
-      const declaration = definitionOf(target);
-      if (declaration && (ts.isPropertyAssignment(declaration) || ts.isPropertyDeclaration(declaration))) {
-        const entries = result.writes.get(declaration) ?? [];
-        entries.push({ node, value }); result.writes.set(declaration, entries);
-      }
-    } else if (ts.isObjectLiteralExpression(target)) {
-      for (const property of target.properties) {
-        if (ts.isShorthandPropertyAssignment(property)) add(property.name, node);
-        else if (ts.isPropertyAssignment(property)) add(property.initializer, node);
-        else if (ts.isSpreadAssignment(property)) add(property.expression, node);
-      }
-    } else if (ts.isArrayLiteralExpression(target)) for (const element of target.elements) add(element, node);
-    else if (ts.isSpreadElement(target)) add(target.expression, node);
-    else if (ts.isBinaryExpression(target)) add(target.left, node);
-  };
-  const pending: ts.Node[] = [sf];
-  while (pending.length) {
-    result.budget.take(); const node = pending.pop()!;
-    if (ts.isIdentifier(node)) {
-      const declaration = symbolOf(node)?.valueDeclaration;
-      if (declaration && (ts.isVariableDeclaration(declaration) || ts.isFunctionDeclaration(declaration)) && declaration.name !== node) result.references.add(declaration);
+function allocatesIndependentInstance(node: ts.ClassLikeDeclaration): boolean {
+  const cached = independentInstances.get(node);
+  if (cached !== undefined) return cached;
+  independentInstances.set(node, false);
+  // Constructors may return an existing object; an unknown base/decorator can
+  // do the same. Such allocations cannot prove separate receiver identities.
+  if (node.heritageClauses?.length || ts.getDecorators(node)?.length) return false;
+  const budget = bindingWriteIndex(node.getSourceFile()).budget;
+  for (const member of node.members) {
+    budget.take();
+    if (!ts.isConstructorDeclaration(member) || !member.body) continue;
+    const pending: ts.Node[] = [member.body];
+    while (pending.length) {
+      budget.take(); const current = pending.pop()!;
+      if (ts.isReturnStatement(current) && current.expression) return false;
+      if (ts.isFunctionLike(current) || ts.isClassLike(current)) continue;
+      ts.forEachChild(current, child => { pending.push(child); });
     }
-    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
-      add(node.left, node, node.operatorToken.kind === ts.SyntaxKind.EqualsToken && (ts.isIdentifier(node.left) || ts.isPropertyAccessExpression(node.left)) ? node.right : undefined);
-    } else if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) add(node.operand, node);
-    ts.forEachChild(node, child => { pending.push(child); });
   }
-  for (const entries of result.writes.values()) entries.sort((a, b) => a.node.pos - b.node.pos);
-  bindingWrites.set(sf, result); return result;
+  independentInstances.set(node, true); return true;
 }
 
-/** Resolve only assignments that dominate the use in the same straight-line list.
- * Branch/nested writes invalidate initializer evidence instead of inventing flow. */
-function currentInitializer(declaration: ts.VariableDeclaration, use: ts.Node): ts.Expression | undefined {
-  const index = writeIndex(declaration.getSourceFile());
-  const writes = index.writes.get(declaration);
-  if (!writes?.length) return declaration.initializer;
-  const list = statementList(declaration);
-  if (!list || statementList(use) !== list || declaration.getSourceFile() !== use.getSourceFile()) return undefined;
-  let value = declaration.initializer;
-  for (const write of writes) {
-    index.budget.take();
-    const statement = write.node.parent;
-    if (!ts.isExpressionStatement(statement) || statement.parent !== list || !write.value) return undefined;
-    if (write.node.end < use.pos) value = write.value;
+/** Allocations and captured aliases identify one receiver. A class field
+ * declaration alone does not identify which instance owns a property write. */
+function receiverIdentity(node: ts.Node, use: ts.Node, seen = new Set<ts.Node>()): ts.Node | undefined {
+  if (seen.has(node) || seen.size > 64) return undefined;
+  const next = new Set(seen).add(node);
+  bindingWriteIndex(node.getSourceFile()).budget.take();
+  if (transparent(node)) return receiverIdentity(node.expression, use, next);
+  if (ts.isObjectLiteralExpression(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node)) return node;
+  if (ts.isNewExpression(node)) {
+    const constructor = receiverIdentity(node.expression, node.expression, next);
+    return constructor && (ts.isClassDeclaration(constructor) || ts.isClassExpression(constructor)) && allocatesIndependentInstance(constructor) ? node : undefined;
   }
-  return value;
+  if (!ts.isIdentifier(node)) return undefined;
+  const declaration = symbolOf(node)?.valueDeclaration;
+  if (declaration && ts.isVariableDeclaration(declaration)) {
+    const value = currentInitializer(declaration, use);
+    return value ? receiverIdentity(value, value, next) : undefined;
+  }
+  return declaration && (ts.isClassExpression(declaration)
+    || ts.isClassDeclaration(declaration) && unchangedClassBinding(declaration, use)) ? declaration : undefined;
 }
 
-/** An exported entry with no local references is reached externally after
- * module initialization. Local references may invoke it during startup, so
- * those entries cannot use the final startup value as proof. */
-function exportedEntry(use: ts.Node, sf: ts.SourceFile): boolean {
-  let entry: ts.Node | undefined;
-  for (let node: ts.Node | undefined = use; node && node !== sf; node = node.parent) {
-    if (ts.isFunctionLike(node)) entry = node;
+/** Property histories belong to a declaration and an exact receiver together.
+ * Unknown receivers and control flow cannot establish a replacement value. */
+function propertyInitializer(declaration: ts.PropertyAssignment | ts.PropertyDeclaration, use: ts.Node, receiver?: ts.Expression): ts.Expression | undefined {
+  const sf = declaration.getSourceFile(), index = bindingWriteIndex(sf), writes = index.writes.get(declaration);
+  index.budget.take();
+  let reads = initializerReads.get(declaration);
+  if (!reads) { reads = new WeakMap(); initializerReads.set(declaration, reads); }
+  const cached = reads.get(use);
+  if (cached !== undefined) return cached ?? undefined;
+  const finish = (value?: ts.Expression) => { reads!.set(use, value ?? null); return value; };
+  if (!writes?.length) return finish(declaration.initializer);
+  if (sf !== use.getSourceFile()) return finish();
+  const identity = receiver && receiverIdentity(receiver, use);
+  if (!identity) return finish();
+  let histories = propertyHistories.get(declaration);
+  if (!histories) {
+    histories = { unknown: false, receivers: new Map(), checked: new Map() };
+    for (const write of writes) {
+      index.budget.take();
+      const target = write.target;
+      const owner = target && (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target))
+        ? receiverIdentity(target.expression, write.node) : undefined;
+      if (!owner) { histories.unknown = true; continue; }
+      const entries = histories.receivers.get(owner) ?? [];
+      entries.push(write); histories.receivers.set(owner, entries);
+    }
+    propertyHistories.set(declaration, histories);
   }
-  if (!entry) return false;
-  if (ts.isFunctionDeclaration(entry) && entry.parent === sf) return !writeIndex(sf).references.has(entry) && !!ts.getModifiers(entry)?.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
-  if ((ts.isArrowFunction(entry) || ts.isFunctionExpression(entry)) && ts.isVariableDeclaration(entry.parent)) {
-    const statement = entry.parent.parent.parent;
-    return !writeIndex(sf).references.has(entry.parent) && ts.isVariableStatement(statement) && statement.parent === sf && !!ts.getModifiers(statement)?.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+  if (histories.unknown) return finish();
+  const entries = histories.receivers.get(identity);
+  if (!entries?.length) return finish(declaration.initializer);
+  let checked = histories.checked.get(identity);
+  if (!checked) {
+    const list = statementList(identity);
+    const valid = !!list && entries.every(write => {
+      index.budget.take();
+      return ts.isExpressionStatement(write.node.parent) && write.node.parent.parent === list && !!write.value;
+    });
+    checked = { list, entries: valid ? entries : undefined }; histories.checked.set(identity, checked);
   }
-  return false;
-}
-
-/** Properties retain declaration identity, including distinct same-named object
- * members. Writes in unknown control flow invalidate initializer evidence. */
-function propertyInitializer(declaration: ts.PropertyAssignment | ts.PropertyDeclaration, use: ts.Node): ts.Expression | undefined {
-  const sf = declaration.getSourceFile(), index = writeIndex(sf), writes = index.writes.get(declaration);
-  if (!writes?.length) return declaration.initializer;
-  if (sf !== use.getSourceFile()) return undefined;
-  const list = statementList(declaration), sameList = statementList(use) === list;
-  const startup = list === sf && exportedEntry(use, sf);
-  if (!list || (!sameList && !startup)) return undefined;
-  let value = declaration.initializer;
-  for (const write of writes) {
-    index.budget.take();
-    const statement = write.node.parent;
-    if (!ts.isExpressionStatement(statement) || statement.parent !== list || !write.value) return undefined;
-    if (startup || write.node.end < use.pos) value = write.value;
-  }
-  return value;
+  if (!checked.entries) return finish();
+  const sameList = statementList(use) === checked.list;
+  const startup = checked.list === sf && exportedEntry(use, sf);
+  if (!sameList && !startup) return finish();
+  return finish(startup ? checked.entries[checked.entries.length - 1].value
+    : precedingInitializer(declaration, use, checked.entries, index.budget));
 }
 
 function callableHandler(node: ts.Expression | undefined, seen = new Set<ts.Node>(), use: ts.Node | undefined = node): boolean {
   if (!node || !use) return false;
   if (seen.has(node) || seen.size > 64) return true; // Unknown handlers are not proof of an error.
   const next = new Set(seen).add(node);
-  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) return callableHandler(node.expression, next, use);
+  if (transparent(node)) return callableHandler(node.expression, next, use);
   if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return true;
   if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const declaration = directDefinition(node);
     if (declaration && ts.isVariableDeclaration(declaration)) {
       const value = currentInitializer(declaration, use);
+      return value ? callableHandler(value, next, value) : true;
+    }
+    if (declaration && (ts.isPropertyAssignment(declaration) || ts.isPropertyDeclaration(declaration))) {
+      const value = propertyInitializer(declaration, use, ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) ? node.expression : undefined);
       return value ? callableHandler(value, next, value) : true;
     }
     if (ts.isIdentifier(node) && node.text === "undefined" && !declaration) return false;
@@ -232,37 +271,52 @@ function asyncCallable(node: ts.Node | undefined, seen = new Set<ts.Node>(), use
   const next = new Set(seen).add(node);
   if (ts.isVariableDeclaration(node)) { const value = currentInitializer(node, use); return asyncCallable(value, next, value); }
   if (ts.isPropertyAssignment(node) || ts.isPropertyDeclaration(node)) { const value = propertyInitializer(node, use); return asyncCallable(value, next, value); }
-  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) return asyncCallable(node.expression, next, use);
-  if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)) return asyncCallable(directDefinition(node), next, use);
-  return ts.isFunctionLike(node) && ts.canHaveModifiers(node) && !!ts.getModifiers(node)?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword);
+  if (transparent(node)) return asyncCallable(node.expression, next, use);
+  if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const declaration = directDefinition(node);
+    if (declaration && (ts.isPropertyAssignment(declaration) || ts.isPropertyDeclaration(declaration))) {
+      const value = propertyInitializer(declaration, use, ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) ? node.expression : undefined);
+      return asyncCallable(value, next, value);
+    }
+    return asyncCallable(declaration, next, use);
+  }
+  return ts.isFunctionLike(node) && !("asteriskToken" in node && node.asteriskToken) && ts.canHaveModifiers(node)
+    && !!ts.getModifiers(node)?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword);
 }
 
 /** Follow known promise origins, rather than unrelated synchronous then/finally methods. */
-function isPromiseValue(node: ts.Expression, seen = new Set<ts.Node>()): boolean {
+function isPromiseValue(node: ts.Expression, seen = new Set<ts.Node>(), use: ts.Node = node): boolean {
   if (seen.has(node) || seen.size > 64) return false;
   const next = new Set(seen).add(node);
-  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) return isPromiseValue(node.expression, next);
-  if (ts.isIdentifier(node)) {
-    const declaration = definitionOf(node);
-    return !!declaration && ts.isVariableDeclaration(declaration) && !!declaration.initializer && isPromiseValue(declaration.initializer, next);
+  if (transparent(node)) return isPromiseValue(node.expression, next, use);
+  if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const declaration = directDefinition(node);
+    const value = declaration && ts.isVariableDeclaration(declaration) ? currentInitializer(declaration, use)
+      : declaration && (ts.isPropertyAssignment(declaration) || ts.isPropertyDeclaration(declaration))
+        ? propertyInitializer(declaration, use, ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) ? node.expression : undefined) : undefined;
+    return !!value && isPromiseValue(value, next, value);
   }
   if (ts.isNewExpression(node)) return ts.isIdentifier(node.expression) && node.expression.text === "Promise" && !symbolOf(node.expression)?.declarations?.length;
   if (!ts.isCallExpression(node)) return false;
   if (isPromiseProducingCall(node)) return true;
   if (asyncCallable(node.expression)) return true;
-  if (!ts.isPropertyAccessExpression(node.expression)) return false;
-  const { expression: receiver, name } = node.expression;
-  if (ts.isIdentifier(receiver) && receiver.text === "Promise" && !symbolOf(receiver)?.declarations?.length && ["resolve", "reject", "all", "allSettled", "race", "any"].includes(name.text)) return true;
-  return ["then", "catch", "finally"].includes(name.text) && isPromiseValue(receiver, next);
+  const target = member(node.expression);
+  if (!target) return false;
+  const { receiver, name } = target;
+  if (ts.isIdentifier(receiver) && receiver.text === "Promise" && !symbolOf(receiver)?.declarations?.length && ["resolve", "reject", "all", "allSettled", "race", "any"].includes(name)) return true;
+  return ["then", "catch", "finally"].includes(name) && isPromiseValue(receiver, next);
 }
 
 /** A discarded rejection or chain without an effective rejection handler. */
 export function isUnhandledRejection(stmt: ts.Statement): ts.CallExpression | null {
-  if (!ts.isExpressionStatement(stmt) || !ts.isCallExpression(stmt.expression)) return null;
-  const call = stmt.expression;
-  if (!ts.isPropertyAccessExpression(call.expression)) return null;
-  const method = call.expression.name.text;
-  const receiver = call.expression.expression;
+  if (!ts.isExpressionStatement(stmt)) return null;
+  let expression = stmt.expression;
+  while (transparent(expression)) expression = expression.expression;
+  if (!ts.isCallExpression(expression)) return null;
+  const call = expression;
+  const target = member(call.expression);
+  if (!target) return null;
+  const { name: method, receiver } = target;
   if (method === "reject" && ts.isIdentifier(receiver) && receiver.text === "Promise" && !symbolOf(receiver)?.declarations?.length) return call;
   if (!["catch", "then", "finally"].includes(method) || !isPromiseValue(receiver)) return null;
   if (method === "catch") return callableHandler(call.arguments[0]) ? null : call;

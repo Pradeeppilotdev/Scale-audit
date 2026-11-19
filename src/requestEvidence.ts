@@ -2,23 +2,48 @@ import ts from "typescript";
 import { importedBinding } from "./bindings.js";
 import { staticExpression, staticProperty } from "./staticValues.js";
 import type { Workspace } from "./workspace.js";
-import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
+import { AnalysisBudget, AnalysisLimitError, projectWorkLimit } from "./analysisBudget.js";
 
 type FunctionNode = ts.SignatureDeclaration & ts.Node;
-function enclosingFunction(node: ts.Node): FunctionNode | undefined {
-  for (let parent = node.parent; parent; parent = parent.parent) if (ts.isFunctionLike(parent)) return parent;
-  return undefined;
+/** Function identities, rather than arbitrary methods named get() or outer lexical scopes. */
+const evidenceCache = new WeakMap<Workspace, ((node: ts.Node) => boolean) | AnalysisLimitError>();
+export function requestEvidence(workspace: Workspace): (node: ts.Node) => boolean {
+  const cached = evidenceCache.get(workspace);
+  if (cached instanceof AnalysisLimitError) throw cached;
+  if (cached) return cached;
+  try {
+    const evidence = buildRequestEvidence(workspace);
+    evidenceCache.set(workspace, evidence);
+    return evidence;
+  } catch (error) {
+    if (error instanceof AnalysisLimitError) evidenceCache.set(workspace, error);
+    throw error;
+  }
 }
 
-/** Function identities, rather than arbitrary methods named get() or outer lexical scopes. */
-const evidenceCache = new WeakMap<Workspace, (node: ts.Node) => boolean>();
-export function requestEvidence(workspace: Workspace): (node: ts.Node) => boolean {
-  const cached = evidenceCache.get(workspace); if (cached) return cached;
+function buildRequestEvidence(workspace: Workspace): (node: ts.Node) => boolean {
   const roots = new Set<ts.Node>();
   const edges = new Map<ts.Node, Set<ts.Node>>();
-  const budget = new AnalysisBudget("Request reachability", projectWorkLimit(workspace.units.map(unit => unit.sf)));
+  const budget = new AnalysisBudget("Request evidence", projectWorkLimit(workspace.units.map(unit => unit.sf)));
+  const owners = new WeakMap<ts.Node, FunctionNode | null>();
+  const enclosingFunction = (node: ts.Node): FunctionNode | undefined => {
+    const known = owners.get(node);
+    if (known !== undefined) return known ?? undefined;
+    const path: ts.Node[] = [node];
+    let owner: FunctionNode | null = null;
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      budget.take();
+      if (ts.isFunctionLike(parent)) { owner = parent; break; }
+      const cached = owners.get(parent);
+      if (cached !== undefined) { owner = cached; break; }
+      path.push(parent);
+    }
+    for (const item of path) { budget.take(); owners.set(item, owner); }
+    return owner ?? undefined;
+  };
+  const expression = (node: ts.Node | undefined) => staticExpression(node, new Set(), budget);
   const httpReceiver = (node: ts.Node): boolean => {
-    const value = staticExpression(node);
+    const value = expression(node);
     if (value && (ts.isCallExpression(value) || ts.isNewExpression(value))) {
       const binding = importedBinding(value.expression);
       if (binding && /^(express|fastify|koa|@koa\/router|node:https?|https?)$/.test(binding.module)) return true;
@@ -28,7 +53,10 @@ export function requestEvidence(workspace: Workspace): (node: ts.Node) => boolea
   };
   const edge = (caller: ts.Node, callee: ts.Node) => { const set = edges.get(caller) ?? new Set(); set.add(callee); edges.set(caller, set); };
   for (const { sf } of workspace.units) {
-    const visit = (node: ts.Node) => {
+    const pending: ts.Node[] = [sf];
+    while (pending.length) {
+      budget.take();
+      const node = pending.pop()!;
       if (ts.isFunctionLike(node)) {
         const exported = ts.canHaveModifiers(node) && ts.getModifiers(node)?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword);
         const variable = ts.isVariableDeclaration(node.parent) && node.parent.initializer === node ? node.parent : undefined;
@@ -44,31 +72,31 @@ export function requestEvidence(workspace: Workspace): (node: ts.Node) => boolea
         if (node.parameters.length >= 2 && /^(req|request)$/.test(node.parameters[0].name.getText()) && /^(res|response|reply)$/.test(node.parameters[1].name.getText())) roots.add(node);
       }
       if (ts.isCallExpression(node)) {
-        const callee = staticExpression(node.expression);
+        const callee = expression(node.expression);
         const caller = enclosingFunction(node);
         if (caller && callee && ts.isFunctionLike(callee)) edge(caller, callee);
-        const expression = node.expression;
-        const binding = importedBinding(expression);
-        const registration = ts.isPropertyAccessExpression(expression) && /^(get|post|put|patch|delete|use|all|head|options)$/.test(expression.name.text) && httpReceiver(expression.expression);
+        const target = node.expression;
+        const binding = importedBinding(target);
+        const registration = ts.isPropertyAccessExpression(target) && /^(get|post|put|patch|delete|use|all|head|options)$/.test(target.name.text) && httpReceiver(target.expression);
         const server = binding && /^(node:)?https?$/.test(binding.module) && binding.name === "createServer";
-        if (ts.isPropertyAccessExpression(expression) && expression.name.text === "route" && httpReceiver(expression.expression)) {
-          const handler = staticExpression(staticProperty(node.arguments[0], "handler", budget));
+        if (ts.isPropertyAccessExpression(target) && target.name.text === "route" && httpReceiver(target.expression)) {
+          const handler = expression(staticProperty(node.arguments[0], "handler", budget));
           if (handler && ts.isFunctionLike(handler)) roots.add(handler);
         }
         // Literal/locally visible arrays execute their standard iteration callbacks.
-        if (caller && ts.isPropertyAccessExpression(expression) && /^(map|forEach|filter|flatMap|some|every|reduce)$/.test(expression.name.text)) {
-          const receiver = staticExpression(expression.expression);
+        if (caller && ts.isPropertyAccessExpression(target) && /^(map|forEach|filter|flatMap|some|every|reduce)$/.test(target.name.text)) {
+          const receiver = expression(target.expression);
           if (receiver && ts.isArrayLiteralExpression(receiver)) for (const argument of node.arguments) {
-            const fn = staticExpression(argument); if (fn && ts.isFunctionLike(fn)) edge(caller, fn);
+            const fn = expression(argument); if (fn && ts.isFunctionLike(fn)) edge(caller, fn);
           }
         }
         if (registration || server) for (const argument of node.arguments) {
-          const fn = staticExpression(argument);
+          const fn = expression(argument);
           if (fn && ts.isFunctionLike(fn)) roots.add(fn);
         }
       }
-      ts.forEachChild(node, visit);
-    }; visit(sf);
+      ts.forEachChild(node, child => { pending.push(child); });
+    }
   }
   const pending = [...roots];
   while (pending.length) {
@@ -76,5 +104,5 @@ export function requestEvidence(workspace: Workspace): (node: ts.Node) => boolea
     for (const callee of edges.get(current) ?? []) { budget.take(); if (!roots.has(callee)) { roots.add(callee); pending.push(callee); } }
   }
   const evidence = (node: ts.Node) => { const owner = enclosingFunction(node); return !!owner && roots.has(owner); };
-  evidenceCache.set(workspace, evidence); return evidence;
+  return evidence;
 }

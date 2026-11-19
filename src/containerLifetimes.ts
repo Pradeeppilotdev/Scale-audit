@@ -1,6 +1,6 @@
 import { constructionCalls, executionLifetimes } from "./executionLifetimes.js";
 import ts from "typescript";
-import { definitionOf, importedBinding, symbolOf, projectFor } from "./bindings.js";
+import { definitionOf, importedBinding, symbolOf, projectFor, retainsSharedBinding } from "./bindings.js";
 import { staticExpression as resolve, staticProperty, staticProperties, staticArray, isUnknownStaticValue, staticToken as token, type StaticToken as Token } from "./staticValues.js";
 import { AnalysisBudget, projectWorkLimit } from "./analysisBudget.js";
 import { requestEvidence } from "./requestEvidence.js";
@@ -248,31 +248,106 @@ export function containerLifetimes(workspace: Workspace): Map<ts.Node, ProviderL
       current = current.expression.expression;
     }
   }
+  type RegistrationGuard = { container: Container; token: Token } | { flag: ts.VariableDeclaration };
+  const registrationGuards = new Map<ts.IfStatement, RegistrationGuard | null>();
+  const registrationBlocks = new Map<ts.Statement, { suspends: boolean; initialized: Map<ts.Declaration, number>; invalidated: Map<ts.Declaration, number>; firstExit: number }>();
+  const registrationGuard = (statement: ts.IfStatement): RegistrationGuard | undefined => {
+    budget.take();
+    const cached = registrationGuards.get(statement); if (cached !== undefined) return cached ?? undefined;
+    let guard: RegistrationGuard | undefined;
+    if (ts.isPrefixUnaryExpression(statement.expression) && statement.expression.operator === ts.SyntaxKind.ExclamationToken) {
+      const condition = statement.expression.operand;
+      if (ts.isCallExpression(condition) && ts.isPropertyAccessExpression(condition.expression) && condition.expression.name.text === "isRegistered" && condition.arguments[0]) {
+        const target = container(condition.expression.expression);
+        if (target) guard = { container: target, token: token(condition.arguments[0]) };
+      } else if (ts.isIdentifier(condition)) {
+        const declaration = symbolOf(condition)?.valueDeclaration ?? definitionOf(condition);
+        if (declaration && ts.isVariableDeclaration(declaration)) {
+          let outer: ts.Node | undefined = declaration.parent;
+          while (outer && !ts.isFunctionLike(outer)) { budget.take(); outer = outer.parent; }
+          if (!outer) guard = { flag: declaration };
+        }
+      }
+    }
+    registrationGuards.set(statement, guard ?? null); return guard;
+  };
+  // Many providers can share one lazy-registration block. Scan suspension and
+  // flag writes once, publishing facts only after the charged pass completes.
+  const registrationBlock = (statement: ts.Statement) => {
+    budget.take();
+    const cached = registrationBlocks.get(statement); if (cached) return cached;
+    const facts = { suspends: false, initialized: new Map<ts.Declaration, number>(), invalidated: new Map<ts.Declaration, number>(), firstExit: Infinity };
+    const definiteWrite = (node: ts.Node): boolean => {
+      let current = node;
+      while (current.parent && (ts.isParenthesizedExpression(current.parent) || ts.isAsExpression(current.parent)
+        || ts.isSatisfiesExpression(current.parent) || ts.isNonNullExpression(current.parent) || ts.isTypeAssertionExpression(current.parent))) {
+        budget.take(); current = current.parent;
+      }
+      if (!ts.isExpressionStatement(current.parent)) return false;
+      current = current.parent;
+      while (current !== statement) {
+        budget.take();
+        if (!current.parent || !ts.isBlock(current.parent)) return false;
+        current = current.parent;
+      }
+      return true;
+    };
+    const recordWrite = (target: ts.Node, write: ts.Node, trueValue = false): void => {
+      const pending = [target];
+      while (pending.length) {
+        budget.take(); const current = pending.pop()!;
+        if (ts.isIdentifier(current)) {
+          const declaration = symbolOf(current)?.valueDeclaration ?? definitionOf(current);
+          if (!declaration) continue;
+          if (trueValue) {
+            if (definiteWrite(write)) facts.initialized.set(declaration, Math.max(facts.initialized.get(declaration) ?? -1, write.getStart()));
+          } else facts.invalidated.set(declaration, Math.max(facts.invalidated.get(declaration) ?? -1, write.getStart()));
+        } else if (ts.isObjectLiteralExpression(current)) {
+          for (const property of current.properties) {
+            budget.take();
+            if (ts.isShorthandPropertyAssignment(property)) pending.push(property.name);
+            else if (ts.isPropertyAssignment(property)) pending.push(property.initializer);
+            else if (ts.isSpreadAssignment(property)) pending.push(property.expression);
+          }
+        } else if (ts.isArrayLiteralExpression(current)) {
+          for (const element of current.elements) { budget.take(); pending.push(element); }
+        } else if (ts.isSpreadElement(current)) pending.push(current.expression);
+        else if (ts.isBinaryExpression(current)) pending.push(current.left);
+        else if (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isSatisfiesExpression(current)
+          || ts.isNonNullExpression(current) || ts.isTypeAssertionExpression(current)) pending.push(current.expression);
+      }
+    };
+    const pending: ts.Node[] = [statement];
+    while (pending.length) {
+      budget.take(); const node = pending.pop()!;
+      if (ts.isFunctionLike(node)) continue;
+      if (ts.isAwaitExpression(node) || ts.isForOfStatement(node) && !!node.awaitModifier) facts.suspends = true;
+      if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) facts.firstExit = Math.min(facts.firstExit, node.getStart());
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment)
+        recordWrite(node.left, node, node.operatorToken.kind === ts.SyntaxKind.EqualsToken && node.right.kind === ts.SyntaxKind.TrueKeyword && ts.isIdentifier(node.left));
+      else if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)) recordWrite(node.operand, node);
+      else if ((ts.isForOfStatement(node) || ts.isForInStatement(node)) && !ts.isVariableDeclarationList(node.initializer)) recordWrite(node.initializer, node);
+      ts.forEachChild(node, child => { pending.push(child); });
+    }
+    registrationBlocks.set(statement, facts); return facts;
+  };
   const guardedRegistration = (r: Registration): boolean => {
     if (!r.site) return false;
     for (let ancestor = r.site.parent; ancestor && !ts.isFunctionLike(ancestor); ancestor = ancestor.parent) {
-      if (!ts.isIfStatement(ancestor) || !ts.isPrefixUnaryExpression(ancestor.expression) || ancestor.expression.operator !== ts.SyntaxKind.ExclamationToken) continue;
-      let branch = r.site; while (branch.parent && branch.parent !== ancestor) branch = branch.parent;
+      budget.take();
+      if (!ts.isIfStatement(ancestor)) continue;
+      const guard = registrationGuard(ancestor); if (!guard) continue;
+      let branch = r.site;
+      while (branch.parent && branch.parent !== ancestor) { budget.take(); branch = branch.parent; }
       if (branch !== ancestor.thenStatement) continue;
-      let yields = false;
-      const inspectYield = (node: ts.Node) => { if (ts.isFunctionLike(node)) return; if (ts.isAwaitExpression(node)) yields = true; ts.forEachChild(node, inspectYield); };
-      inspectYield(ancestor.thenStatement); if (yields) continue;
-      const condition = ancestor.expression.operand;
-      if (ts.isCallExpression(condition) && ts.isPropertyAccessExpression(condition.expression) && condition.expression.name.text === "isRegistered" && condition.arguments[0]
-        && container(condition.expression.expression) === r.container && token(condition.arguments[0]) === r.token) return true;
-      if (!ts.isIdentifier(condition)) continue;
-      const declaration = definitionOf(condition);
-      if (!declaration || !ts.isVariableDeclaration(declaration)) continue;
-      let outer: ts.Node | undefined = declaration.parent; while (outer && !ts.isFunctionLike(outer)) outer = outer.parent;
-      if (outer) continue;
-      let initialized = false;
-      const inspect = (node: ts.Node) => {
-        budget.take(); if (ts.isFunctionLike(node)) return;
-        if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && node.right.kind === ts.SyntaxKind.TrueKeyword
-          && definitionOf(node.left) === declaration && node.getStart() > r.site!.getStart()) initialized = true;
-        ts.forEachChild(node, inspect);
-      };
-      inspect(ancestor.thenStatement); if (initialized) return true;
+      const facts = registrationBlock(ancestor.thenStatement); if (facts.suspends) continue;
+      if ("container" in guard) {
+        if (guard.container === r.container && guard.token === r.token) return true;
+      } else {
+        const initialized = facts.initialized.get(guard.flag) ?? -1;
+        if (initialized > r.site.getStart() && initialized > (facts.invalidated.get(guard.flag) ?? -1) && initialized < facts.firstExit
+          && retainsSharedBinding(guard.flag)) return true;
+      }
     }
     return false;
   };

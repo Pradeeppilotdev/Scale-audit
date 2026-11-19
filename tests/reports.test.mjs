@@ -49,3 +49,19 @@ test('report provenance and analysis limits render with HTML escaping', () => {
   assert.match(html,/report schema 1/);assert.match(html,/&lt;runtime&gt;/);
   assert.doesNotMatch(html,/<runtime>/);
 });
+
+test("Markdown retains template literals, backtick filenames and embedded diff fences as code", () => {
+  const value = report();
+  value.repo = "repo`with`ticks";
+  const finding = { id: "sync-io", category: "I/O", severity: "high", confidence: "high",
+    file: "src/`file`.ts", line: 3, snippet: "readFileSync(`snapshot-${id}.json`)",
+    message: "blocking call", scaleTrigger: "load", suggestedFix: "use async I/O" };
+  value.findings = [finding];
+  value.firstBottleneck = finding;
+  value.codemod.diff = "--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-/*\n```\n+*/\n";
+  const markdown = renderMarkdown(value);
+  assert.ok(markdown.includes("- Repo: ``repo`with`ticks``"));
+  assert.ok(markdown.includes("``src/`file`.ts:3``"));
+  assert.ok(markdown.includes("``readFileSync(`snapshot-${id}.json`)``"));
+  assert.ok(markdown.includes("````diff\n" + value.codemod.diff.trimEnd() + "\n````"));
+});

@@ -10,8 +10,8 @@ export function renderMarkdown(report: Report): string {
   const severity = interpretation.bySeverity;
   lines.push(`# Scale-Readiness Report`);
   lines.push("");
-  lines.push(`- Repo: \`${report.repo}\``);
-  if (report.commit) lines.push(`- Commit: \`${report.commit.slice(0, 12)}\``);
+  lines.push(`- Repo: ${inlineCode(report.repo)}`);
+  if (report.commit) lines.push(`- Commit: ${inlineCode(report.commit.slice(0, 12))}`);
   if (report.analyzer) lines.push(`- Analyzer: ${report.analyzer.name}@${report.analyzer.version} (report schema ${report.schemaVersion ?? "unknown"})`);
   lines.push(`- Scanned: ${report.scannedAt}`);
   lines.push(`- Framework: ${report.fingerprint.framework ?? "unknown"}`);
@@ -50,7 +50,7 @@ export function renderMarkdown(report: Report): string {
     lines.push(
       `First bottleneck: **${report.firstBottleneck.category}** — ${report.firstBottleneck.message}`,
     );
-    lines.push(`- Evidence: \`${report.firstBottleneck.file}:${report.firstBottleneck.line}\``);
+    lines.push(`- Evidence: ${inlineCode(`${report.firstBottleneck.file}:${report.firstBottleneck.line}`)}`);
     lines.push(`- Why: ${report.firstBottleneck.scaleTrigger}`);
     lines.push(`- Fix: ${report.firstBottleneck.suggestedFix}`);
   } else {
@@ -77,10 +77,10 @@ export function renderMarkdown(report: Report): string {
   lines.push("");
   for (const [i, f] of top.entries()) {
     lines.push(`${i + 1}. **[${f.severity}] ${f.message}**`);
-    lines.push(`   - Location: \`${f.file}:${f.line}\``);
+    lines.push(`   - Location: ${inlineCode(`${f.file}:${f.line}`)}`);
     lines.push(`   - Why it breaks: ${f.scaleTrigger}`);
     lines.push(`   - Fix: ${f.suggestedFix}`);
-    if (f.snippet) lines.push(`   - Snippet: \`${oneLine(f.snippet).slice(0, 160)}\``);
+    if (f.snippet) lines.push(`   - Snippet: ${inlineCode(oneLine(f.snippet).slice(0, 160))}`);
   }
 
   const byCategory = group(report.findings);
@@ -91,7 +91,7 @@ export function renderMarkdown(report: Report): string {
     lines.push(`### ${category} (${items.length})`);
     lines.push("");
     for (const f of items.slice(0, MAX_PER_CATEGORY)) {
-      lines.push(`- [${f.severity}] ${f.message} (\`${f.file}:${f.line}\`)`);
+      lines.push(`- [${f.severity}] ${f.message} (${inlineCode(`${f.file}:${f.line}`)})`);
     }
     if (items.length > MAX_PER_CATEGORY) {
       lines.push(`- …and ${items.length - MAX_PER_CATEGORY} more in this category (use the JSON output for the full list).`);
@@ -104,16 +104,17 @@ export function renderMarkdown(report: Report): string {
     lines.push("");
     lines.push(`- ${cm.patched} suggestion(s) generated; ${cm.appliedEdits ?? 0} edit(s) applied; ${cm.unpatched} site(s) have no generated patch.`);
     for (const e of cm.edits.slice(0, MAX_PER_CATEGORY)) {
-      lines.push(`- \`${e.file}:${e.line}\` — ${e.description}${e.safe ? "" : " (review required; never auto-applied)"}`);
+      lines.push(`- ${inlineCode(`${e.file}:${e.line}`)} — ${e.description}${e.safe ? "" : " (review required; never auto-applied)"}`);
     }
     for (const e of (cm.manual ?? []).slice(0, MAX_PER_CATEGORY)) {
-      lines.push(`- Manual: \`${e.file}:${e.line}\` — ${e.description}`);
+      lines.push(`- Manual: ${inlineCode(`${e.file}:${e.line}`)} — ${e.description}`);
     }
     if (cm.diff) {
       lines.push("");
-      lines.push("```diff");
+      const fence = codeDelimiter(cm.diff, 3);
+      lines.push(`${fence}diff`);
       lines.push(cm.diff.trimEnd());
-      lines.push("```");
+      lines.push(fence);
     }
     lines.push("");
   }
@@ -149,4 +150,19 @@ function group(findings: Finding[]): Map<string, Finding[]> {
 
 function oneLine(s: string): string {
   return s.replace(/\s+/g, " ").trim();
+}
+
+function codeDelimiter(text: string, minimum = 1): string {
+  let length = minimum;
+  for (const match of text.matchAll(/`+/g)) length = Math.max(length, match[0].length + 1);
+  return "`".repeat(length);
+}
+
+/** A snippet or filename may itself contain Markdown backticks. */
+function inlineCode(value: string): string {
+  const text = value.replace(/\r\n?|\n/g, " ");
+  const fence = codeDelimiter(text);
+  const pad = text.startsWith("`") || text.endsWith("`")
+    || /\S/.test(text) && (text.startsWith(" ") || text.endsWith(" ")) ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
 }

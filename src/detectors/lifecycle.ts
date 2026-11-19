@@ -2,7 +2,7 @@ import { definitionOf, importedBinding, projectFor, symbolOf } from "../bindings
 import { dependencies, knownCallback, processEvent, serviceContexts, type StartupContext } from "../serviceContext.js";
 import ts from "typescript";
 import { AnalysisBudget, AnalysisLimitError, projectWorkLimit } from "../analysisBudget.js";
-import { lineOf, snippetAt, makeFinding } from "./common.js";
+import { lineOf, sourceSnippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
 
@@ -52,7 +52,7 @@ export async function detectLifecycle(root: string, ws?: Workspace): Promise<Fin
             message: "No health/liveness endpoint found in this service’s visible startup graph.",
             scaleTrigger: "Load balancers/orchestrators cannot detect unhealthy instances, causing bad traffic routing during incidents.",
             suggestedFix: "Add GET /health (liveness) and GET /ready (readiness) with a cheap DB/queue check for readiness.",
-            snippet: snippetAt(serverFile.content, serverFile.line),
+            snippet: sourceSnippetAt(serverFile.sf, serverFile.line),
           }),
         );
       }
@@ -69,7 +69,7 @@ export async function detectLifecycle(root: string, ws?: Workspace): Promise<Fin
             message: "No SIGTERM/SIGINT shutdown handler was established for this server’s visible startup path.",
             scaleTrigger: "On deploys/scale-down, in-flight requests fail and DB/connection cleanup is skipped.",
             suggestedFix: "Handle SIGTERM: stop accepting connections, drain in-flight requests with a timeout, then close DB/queue clients.",
-            snippet: snippetAt(serverFile.content, serverFile.line),
+            snippet: sourceSnippetAt(serverFile.sf, serverFile.line),
           }),
         );
       }

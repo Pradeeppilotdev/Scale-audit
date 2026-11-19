@@ -10,6 +10,8 @@ export interface Finding {
   confidence: "high" | "medium" | "low";
   file: string;
   line: number;
+  /** One-based column when the detector identifies an individual call site. */
+  column?: number;
   snippet: string;
   message: string;
   scaleTrigger: string;

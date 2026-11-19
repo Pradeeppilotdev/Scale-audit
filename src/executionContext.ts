@@ -1,4 +1,4 @@
-import { projectFor, symbolOf } from "./bindings.js";
+import { isCommonJsRequire, projectFor, symbolOf } from "./bindings.js";
 import path from "node:path";
 import ts from "typescript";
 import type { Workspace } from "./workspace.js";
@@ -71,7 +71,7 @@ export async function executionContexts(root: string, workspace: Workspace, requ
         && /^(req|request)$/.test(node.parameters[0].name.getText())
         && /^(res|response|reply)$/.test(node.parameters[1].name.getText())) roots.request.add(rel);
       if (ts.isCallExpression(node)) {
-        if ((node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === "require"))
+        if ((node.expression.kind === ts.SyntaxKind.ImportKeyword || isCommonJsRequire(node.expression))
           && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) add(node.arguments[0].text);
         // Route/server registrations override script-directory and CLI hints.
         const callee = node.expression.getText();

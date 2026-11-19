@@ -98,3 +98,23 @@ test('aliased HTTP factories and request callback signatures keep warnings promi
     "import {read} from './helper.js'; api.get('/read', (req, res) => read());",
   ]) await audit({'main.ts':entry,'helper.ts':helper},findings=>assert.equal(findings[0].severity,'high'));
 });
+
+test('image processing requires a reachable call and distinguishes package aliases from local names', async () => {
+  await audit({
+    'route.ts': [
+      "import transform from 'sharp';",
+      "import {Jimp as Picture} from 'jimp';",
+      "const sharp = value => value;",
+      "function background() { transform('worker.png'); }",
+      "export function GET(request) {",
+      "  // The background job uses sharp().",
+      "  const docs = 'imagemagick.resize() and sharp()';",
+      "  sharp(docs);",
+      "  Picture.read(request.body);",
+      "  return transform(request.body).resize(10).toBuffer();",
+      "}",
+    ].join('\n'),
+  }, findings => {
+    assert.deepEqual(findings.filter(f => f.id === 'image-processing-in-request').map(f => f.line), [9, 10]);
+  });
+});

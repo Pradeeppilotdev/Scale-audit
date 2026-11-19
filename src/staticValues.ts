@@ -1,5 +1,5 @@
 import ts from "typescript";
-import { definitionOf } from "./bindings.js";
+import { currentInitializer, definitionOf, symbolOf } from "./bindings.js";
 import { AnalysisBudget, AnalysisLimitError } from "./analysisBudget.js";
 
 export type StaticToken = string | ts.Node;
@@ -15,8 +15,14 @@ export function staticExpression(node: ts.Node | undefined, seen = new Set<ts.No
     visited.add(current);
     if (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isSatisfiesExpression(current) || ts.isNonNullExpression(current) || ts.isAwaitExpression(current) || ts.isTypeAssertionExpression(current)) { current = current.expression; continue; }
     if (ts.isIdentifier(current) || ts.isPropertyAccessExpression(current)) {
-      const declaration = definitionOf(current);
-      if (declaration && ts.isVariableDeclaration(declaration)) { current = declaration.initializer; continue; }
+      // Preserve a local alias's own capture time instead of letting the
+      // general binding resolver skip directly to its original initializer.
+      const direct = symbolOf(current)?.valueDeclaration;
+      const declaration = direct && ts.isVariableDeclaration(direct) ? direct : definitionOf(current);
+      if (declaration && ts.isVariableDeclaration(declaration)) {
+        current = currentInitializer(declaration, current) ?? unknownStaticValue();
+        continue;
+      }
       if (declaration && (ts.isIdentifier(current) || ts.isClassDeclaration(declaration) || ts.isFunctionDeclaration(declaration))) return declaration;
     }
     return current;
@@ -87,26 +93,68 @@ export function staticArray(node: ts.Node | undefined, seen = new Set<ts.Node>()
   return result;
 }
 
+type StaticTruth = boolean | undefined;
+interface ReturnPath {
+  result?: ts.Expression[];
+  branch?: { condition: ts.Expression; outcomes: Map<StaticTruth, ReturnPath> };
+}
+interface FactoryIndex {
+  methods: WeakMap<ts.ClassLikeDeclaration, Map<string, ts.MethodDeclaration>>;
+  facts: WeakMap<ts.MethodDeclaration, { parameters: Map<ts.Declaration, number>; path: ReturnPath }>;
+}
+const factoryIndexes = new WeakMap<AnalysisBudget, FactoryIndex>();
+class StaticReturnBudget extends AnalysisBudget {
+  constructor(private readonly projectBudget?: AnalysisBudget) { super("Static module returns"); }
+  override take(count = 1): void {
+    this.projectBudget?.take(count);
+    super.take(count);
+  }
+}
+
 /** Resolve a local static module method's literal returns without invoking it. */
-export function staticReturns(call: ts.CallExpression): ts.Expression[] {
+export function staticReturns(call: ts.CallExpression, shared?: AnalysisBudget): ts.Expression[] {
   if (!ts.isPropertyAccessExpression(call.expression)) return [];
   const owner = definitionOf(call.expression.expression);
   if (!owner || (!ts.isClassDeclaration(owner) && !ts.isClassExpression(owner))) return [];
-  const methodName = call.expression.name.text;
-  const method = owner.members.find(member => ts.isMethodDeclaration(member) && member.name.getText() === methodName
-    && ts.getModifiers(member)?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword));
-  if (!method || !ts.isMethodDeclaration(method) || !method.body) return [];
-  const budget = new AnalysisBudget("Static module returns");
-  const argumentsByParameter = new Map<ts.Node, ts.Expression>();
-  for (let i = 0; i < method.parameters.length; i++) {
-    const argument = call.arguments[i] ?? method.parameters[i].initializer;
-    if (argument) argumentsByParameter.set(method.parameters[i], argument);
+  const budget = new StaticReturnBudget(shared), lookupBudget = shared ?? budget;
+  lookupBudget.take();
+  let index = factoryIndexes.get(lookupBudget);
+  if (!index) {
+    index = { methods: new WeakMap(), facts: new WeakMap() };
+    factoryIndexes.set(lookupBudget, index);
   }
+  let methods = index.methods.get(owner);
+  if (!methods) {
+    methods = new Map();
+    for (const member of owner.members) {
+      lookupBudget.take();
+      if (ts.isMethodDeclaration(member) && member.body
+        && (ts.isIdentifier(member.name) || ts.isStringLiteralLike(member.name))
+        && ts.getModifiers(member)?.some(modifier => modifier.kind === ts.SyntaxKind.StaticKeyword)) methods.set(member.name.text, member);
+    }
+    index.methods.set(owner, methods);
+  }
+  const method = methods.get(call.expression.name.text);
+  if (!method?.body) return [];
+  let facts = index.facts.get(method);
+  if (!facts) {
+    const parameters = new Map<ts.Declaration, number>();
+    for (let i = 0; i < method.parameters.length; i++) { lookupBudget.take(); parameters.set(method.parameters[i], i); }
+    facts = { parameters, path: {} };
+    index.facts.set(method, facts);
+  }
+  const { parameters, path } = facts;
+  if (path.result) return path.result;
+  let readParameter = false;
   const truth = (node: ts.Expression, depth = 0): boolean | undefined => {
     budget.take(); if (depth > 64) throw new AnalysisLimitError("Static condition recursion limit exceeded");
     const definition = definitionOf(node);
-    const argument = definition && argumentsByParameter.get(definition);
-    if (argument) return truth(argument, depth + 1);
+    const parameter = definition && parameters.get(definition);
+    if (parameter !== undefined) {
+      readParameter = true;
+      const argument = call.arguments[parameter] ?? method.parameters[parameter].initializer;
+      if (argument) return truth(argument, depth + 1);
+    }
     const value = staticExpression(node, new Set(), budget);
     if (!value) return undefined;
     if (value.kind === ts.SyntaxKind.TrueKeyword) return true;
@@ -118,12 +166,38 @@ export function staticReturns(call: ts.CallExpression): ts.Expression[] {
     }
     return undefined;
   };
+  // Branches are the only part of the return walk that uses call arguments.
+  // Re-evaluate each observed condition with this call's arguments and depth
+  // checks. An unconditional result needs no body or argument traversal.
+  const conditions = new Map<ts.Expression, { value: StaticTruth; argumentDependent: boolean }>();
+  const decision = (condition: ts.Expression) => {
+    const cached = conditions.get(condition); if (cached) return cached;
+    readParameter = false;
+    const value = truth(condition);
+    const observed = { value, argumentDependent: readParameter };
+    conditions.set(condition, observed);
+    return observed;
+  };
+  let known = path;
+  while (known.branch) {
+    budget.take();
+    const next = known.branch.outcomes.get(decision(known.branch.condition).value);
+    if (!next) break;
+    known = next;
+  }
+  if (known.result) return known.result;
+  const trace: { condition: ts.Expression; value: StaticTruth }[] = [];
+  const branch = (condition: ts.Expression): StaticTruth => {
+    const { value, argumentDependent } = decision(condition);
+    if (argumentDependent) trace.push({ condition, value });
+    return value;
+  };
   const result: ts.Expression[] = [];
   const returned = (expression: ts.Expression, depth = 0) => {
     budget.take(); if (depth > 64) throw new AnalysisLimitError("Static return recursion limit exceeded");
     const value = staticExpression(expression, new Set(), budget);
     if (value && ts.isConditionalExpression(value)) {
-      const condition = truth(value.condition);
+      const condition = branch(value.condition);
       if (condition !== false) returned(value.whenTrue, depth + 1);
       if (condition !== true) returned(value.whenFalse, depth + 1);
     } else result.push(expression);
@@ -134,7 +208,7 @@ export function staticReturns(call: ts.CallExpression): ts.Expression[] {
     if (ts.isReturnStatement(node) && node.expression) { returned(node.expression); return true; }
     if (ts.isBlock(node)) { for (const statement of node.statements) if (collect(statement, depth + 1)) return true; return false; }
     if (ts.isIfStatement(node)) {
-      const condition = truth(node.expression);
+      const condition = branch(node.expression);
       if (condition === true) return collect(node.thenStatement, depth + 1);
       if (condition === false) return !!node.elseStatement && collect(node.elseStatement, depth + 1);
       const thenReturns = collect(node.thenStatement, depth + 1);
@@ -146,5 +220,15 @@ export function staticReturns(call: ts.CallExpression): ts.Expression[] {
     return false;
   };
   collect(method.body);
+  // Publish a completed path only after all local and project work checks.
+  budget.take(trace.length);
+  let leaf = path;
+  for (const { condition, value } of trace) {
+    const { outcomes } = leaf.branch ??= { condition, outcomes: new Map<StaticTruth, ReturnPath>() };
+    let next = outcomes.get(value);
+    if (!next) { next = {}; outcomes.set(value, next); }
+    leaf = next;
+  }
+  leaf.result = result;
   return result;
 }

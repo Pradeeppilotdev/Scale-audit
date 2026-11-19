@@ -1,6 +1,6 @@
 import path from "node:path";
 import ts from "typescript";
-import { checkerFor, definitionOf, importedBinding, projectFor, symbolOf } from "./bindings.js";
+import { checkerFor, definitionOf, importedBinding, isCommonJsRequire, projectFor, symbolOf } from "./bindings.js";
 import { AnalysisBudget, AnalysisLimitError, projectWorkLimit } from "./analysisBudget.js";
 import { isRecord, parseRepoManifest, readRepoFile, RepoInputBudget, MAX_MANIFEST_BYTES } from "./repoFiles.js";
 import type { SourceUnit, Workspace } from "./workspace.js";
@@ -1546,7 +1546,7 @@ export class ServiceContexts {
           if (dependency) this.awaitedImports.set(node, dependency);
         }
       }
-      if (ts.isIdentifier(node.expression) && node.expression.text === "require" && !symbolOf(node.expression)?.declarations?.length) {
+      if (isCommonJsRequire(node.expression)) {
         const specifier = resolveArgument(node.arguments[0], env);
         this.addImport(out, node.getSourceFile(), specifier, certain);
         if (specifier && ts.isStringLiteralLike(specifier)) {

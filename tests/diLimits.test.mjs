@@ -18,7 +18,18 @@ test('nested static metadata retains scope or fails explicitly instead of return
  await audit(nested(80),r=>assert.equal(repeated(r).length,1));
  await fixture(nested(512),async root=>{const r=await runAudit(root);assert.equal(r.complete,false);assert.ok(r.detectors.some(d=>d.status==='failed'&&d.reason==='Static expression recursion limit exceeded'));});
 });
-test('long Nest re-export paths are stack-safe',async()=>{const n=2400;let source="import {Module,Scope} from '@nestjs/common';import {Pool} from 'pg';@Module({providers:[{provide:'CTX',useFactory:()=>({}),scope:Scope.REQUEST}],exports:['CTX']})class M0{}";for(let i=1;i<=n;i++)source+=`@Module({imports:[M${i-1}],exports:[M${i-1}]})class M${i}{}`;source+=`@Module({imports:[M${n}],providers:[{provide:'DB',inject:['CTX'],useFactory:()=>new Pool()}]})class App{}`;await audit(source,r=>assert.equal(repeated(r).length,1));});
+for (const n of [40, 2400]) test(`Nest re-export paths ${n < 64 ? 'retain request scope' : 'fail explicitly beyond the depth limit'}`, async () => {
+ let source="import {Module,Scope} from '@nestjs/common';import {Pool} from 'pg';@Module({providers:[{provide:'CTX',useFactory:()=>({}),scope:Scope.REQUEST}],exports:['CTX']})class M0{}";
+ for(let i=1;i<=n;i++)source+=`@Module({imports:[M${i-1}],exports:[M${i-1}]})class M${i}{}`;
+ source+=`@Module({imports:[M${n}],providers:[{provide:'DB',inject:['CTX'],useFactory:()=>new Pool()}]})class App{}`;
+ await audit(source,report=>{
+  if(n<64){assert.equal(report.complete,true);assert.equal(repeated(report).length,1);}
+  else{
+   assert.equal(report.complete,false);
+   assert.ok(report.detectors.some(detector=>detector.name==='detectPerRequestClients'&&detector.status==='failed'&&detector.reason==='Nest module recursion limit exceeded'));
+  }
+ });
+});
 test('metadata invalidation and merging consume the total-work budget',()=>{const n=300;const source='const object={'+Array.from({length:n},(_,i)=>`p${i}:0`).join(',')+','+Array.from({length:n},()=>`...runtime`).join(',')+'};';const sf=ts.createSourceFile('invalidation.ts',source,ts.ScriptTarget.Latest,true);assert.throws(()=>staticProperty(sf.statements[0].declarationList.declarations[0].initializer,'p0',new AnalysisBudget('Invalidation probe',n*2+2)),/analysis work budget exceeded/);});
 for(const scope of ['REQUEST','DEFAULT'])test(`nested spread restores explicit Nest ${scope} scope`,async()=>{await audit(`import {Injectable,Module,Scope} from '@nestjs/common';import {Pool} from 'pg';const runtime=JSON.parse(process.env.OPTS??'{}');const base={scope:Scope.${scope},...runtime};const options={...base,scope:Scope.${scope}};@Injectable({...options})class Database{pool=new Pool();}@Module({providers:[Database]})class App{}`,r=>assert.equal(connection(r).length,scope==='REQUEST'?1:0));});
 for(const flag of ['true','false','runtimeFlag'])test(`dynamic Nest return alternatives preserve scope for ${flag}`,async()=>{await audit(`import {Module,Scope} from '@nestjs/common';${db}const runtimeFlag=JSON.parse('true');@Module({})class Dynamic{static forRoot(flag){if(flag)return {module:Dynamic,providers:[{provide:Database,useClass:Database,scope:Scope.REQUEST}]};return {module:Dynamic,providers:[{provide:Database,useClass:Database,scope:Scope.DEFAULT}]};}}@Module({imports:[Dynamic.forRoot(${flag})]})class App{}`,r=>assert.equal(repeated(r).length,flag==='false'?0:1));});

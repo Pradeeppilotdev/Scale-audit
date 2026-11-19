@@ -31,4 +31,32 @@ jobs:
           check-latest: true
       - run: npm ci
       - run: npm run build
-      - run: npm pack --dry-run
+      - name: Install the tarball and audit a request handler
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir=$(mktemp -d "$RUNNER_TEMP/scale-package.XXXXXX")
+          npm pack --pack-destination "$package_dir"
+          npm install --prefix "$package_dir/install" --ignore-scripts --no-audit --no-fund "$package_dir"/*.tgz
+          "$package_dir/install/node_modules/.bin/scale-audit" tests/fixtures/badapp --out "$package_dir/report.json"
+          node - "$package_dir/report.json" <<'NODE'
+          const assert = require('node:assert/strict');
+          const report = require(process.argv[2]);
+          assert.equal(report.analyzer.version, require('./package.json').version);
+          assert.equal(report.complete, true);
+          assert.ok(report.findings.some(f => f.id === 'sync-io' && f.severity === 'high'));
+          NODE
+      - name: Audit the pinned regression corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          corpus=$(mktemp -d "$RUNNER_TEMP/scale-corpus.XXXXXX")
+          fetch_case() {
+            local name="$1" remote="$2" revision
+            revision=$(node -p "require('./tests/corpus/baseline.json')[process.argv[1]].commit" "$name")
+            git init --bare --quiet "$corpus/$name.git"
+            git -C "$corpus/$name.git" fetch --quiet --no-tags --depth=1 "$remote" "$revision"
+          }
+          fetch_case nanpolis https://github.com/Pradeeppilotdev/nanpolis.git
+          fetch_case hono https://github.com/honojs/hono.git
+          node tests/corpus/check.mjs "nanpolis=$corpus/nanpolis.git" "hono=$corpus/hono.git"

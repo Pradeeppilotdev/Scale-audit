@@ -16,6 +16,8 @@ jobs:
           # Security-patched release line (Oct 21, 2026 advisories).
           node-version: "^24.22.1"
           check-latest: true
+      - name: Check the release tag against the package version
+        run: node -e "require('node:assert/strict').equal(process.env.GITHUB_REF_NAME, 'v' + require('./package.json').version)"
       - run: npm ci
       - run: npm run build
       - run: npm test

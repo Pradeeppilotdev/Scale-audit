@@ -12,6 +12,17 @@ test("runtime requirement stays aligned with published package engines", () => {
   assert.equal(REQUIRED_NODE, pkg.engines.node);
 });
 
+test("the lockfile and GitHub Action default select the package release", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
+  const action = readFileSync(new URL("../.github/actions/scale-audit/action.yml", import.meta.url), "utf8");
+  const versionInput = action.match(/^  version:\s*\n((?:    [^\n]*\n)+)/m)?.[1];
+  const defaultVersion = versionInput?.match(/^    default:[ \t]*["']?([^"'\s#]+)["']?(?:[ \t]+#.*)?$/m)?.[1];
+  assert.equal(defaultVersion, manifest.version);
+  assert.equal(lock.version, manifest.version);
+  assert.equal(lock.packages[""].version, manifest.version);
+});
+
 test("runtime accepts patched stable releases and rejects older, unsupported and prerelease versions", () => {
   for (const version of ["22.23.4", "22.24.0", "24.22.1", "24.23.0", "26.12.1", "26.13.0", "27.0.0", "v26.12.1"]) {
     assert.equal(isSupportedNode(version), true, version);

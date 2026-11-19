@@ -3,13 +3,14 @@ import { executionLifetimes } from "../executionLifetimes.js";
 import { requestEvidence } from "../requestEvidence.js";
 import { containerLifetimes } from "../containerLifetimes.js";
 import { providerLifetimes, type ProviderLifetime } from "../lifetimes.js";
-import { definitionOf, importedBinding, projectFor, symbolOf } from "../bindings.js";
+import { currentImportedBinding, definitionOf, projectFor, symbolOf, retainsSharedBinding } from "../bindings.js";
 import ts from "typescript";
-import { lineOf, snippetAt, makeFinding } from "./common.js";
+import { locationOf, sourceSnippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
 import { executionContexts } from "../executionContext.js";
 import { isRequestPath } from "./syncIo.js";
+import { conditionTruth } from "../conditionTruth.js";
 
 /**
  * Clients created per request.
@@ -49,23 +50,26 @@ export async function detectPerRequestClients(root: string, ws?: Workspace): Pro
   }
   lifetimes = executionLifetimes(workspace, lifetimes);
   const contexts = await executionContexts(root, workspace, isRequestPath);
-  for (const { rel, content, sf } of workspace.units) {
+  for (const { rel, sf } of workspace.units) {
     const requestPath = contexts.get(rel)?.request ?? isRequestPath(rel);
-    visit(sf, sf, content, rel, requestPath, out, lifetimes, request);
+    visit(sf, sf, rel, requestPath, out, lifetimes, request);
   }
   return out;
 }
 
-function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, requestPath: boolean, out: Finding[], lifetimes: Map<ts.Node, ProviderLifetime>, request: (node: ts.Node) => boolean): void {
+function visit(node: ts.Node, sf: ts.SourceFile, rel: string, requestPath: boolean, out: Finding[], lifetimes: Map<ts.Node, ProviderLifetime>, request: (node: ts.Node) => boolean): void {
   if (ts.isNewExpression(node) || ts.isCallExpression(node)) {
     const name = ts.isIdentifier(node.expression) ? node.expression.text : ts.isPropertyAccessExpression(node.expression) ? node.expression.name.getText() : "";
-    const imported = importedBinding(ts.isPropertyAccessExpression(node.expression) ? node.expression.expression : node.expression);
-    const declaration = definitionOf(node.expression);
+    const imported = currentImportedBinding(node.expression, node.expression);
+    const declaration = symbolOf(node.expression)?.valueDeclaration ?? definitionOf(node.expression);
     const knownPackage = imported && /^(?:@prisma\/client|pg|mysql2(?:\/promise)?|mysql|redis|ioredis|mongodb|sequelize|typeorm|knex)$/.test(imported.module);
-    const localClass = declaration && (ts.isClassDeclaration(declaration) || ts.isClassExpression(declaration) || ts.isFunctionDeclaration(declaration));
+    const localClass = !imported && declaration && (ts.isClassDeclaration(declaration) || ts.isClassExpression(declaration) || ts.isFunctionDeclaration(declaration));
     const defaultName = imported?.name === "default" ? ({ ioredis: "Redis", sequelize: "Sequelize", knex: "Knex" } as Record<string, string>)[imported.module] : undefined;
     const actualName = defaultName ?? (imported && imported.name !== "default" && imported.name !== "*" ? imported.name : name);
-    if (CLIENT_CONSTRUCTORS.has(actualName) && !localClass && (knownPackage || (!imported && !declaration && ts.isNewExpression(node)))) {
+    // A member spelling cannot restore native evidence after its receiver has
+    // become local or unknown. Keep name-only evidence for unresolved globals.
+    const unresolvedConstructor = !imported && !declaration && ts.isNewExpression(node) && ts.isIdentifier(node.expression);
+    if (CLIENT_CONSTRUCTORS.has(actualName) && !localClass && (knownPackage || unresolvedConstructor)) {
       const staticOwner = staticAllocationOwner(node);
       const staticField = !!staticOwner && !request(staticOwner);
       const repeatedClass = !!staticOwner && request(staticOwner) || !staticField && classConstructedPerCall(node, lifetimes);
@@ -75,7 +79,7 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, r
       const uncertain = lifetime?.kind === "unknown";
       const insideFunction = isInsideFunction(node) || repeatedClass;
       if ((insideFunction || perRequest || transient || uncertain) && (perRequest || transient || uncertain || ((repeatedClass || !isSingletonPattern(node, lifetimes)) && lifetime?.kind !== "singleton"))) {
-        const ln = lineOf(sf, node);
+        const { line, column } = locationOf(sf, node);
         out.push(
           makeFinding({
             id: uncertain ? "unknown-provider-lifetime" : transient ? "transient-client-lifetime" : "per-request-client",
@@ -83,20 +87,20 @@ function visit(node: ts.Node, sf: ts.SourceFile, content: string, rel: string, r
             severity: transient || uncertain ? "info" : perRequest || requestPath ? "high" : "medium",
             confidence: transient || uncertain ? "low" : perRequest || requestPath ? "medium" : "low",
             file: rel,
-            line: ln,
+            line, column,
             message: uncertain ? "Provider lifetime could not be resolved from static metadata; verify whether its client is shared." : transient ? "Client allocated by a transient provider: instances are per consumer, not automatically per request."
               : perRequest ? "Client allocated by a provider resolved anew by a request handler or request scope; its connections are recreated."
               : `"${ts.isNewExpression(node) ? "new " : ""}${name}()" is created inside a function; each call opens a new connection pool.`,
             scaleTrigger:
               uncertain ? "Dynamic provider metadata can select singleton, transient or request lifetime." : transient ? "Connection count depends on consumer lifetimes; verify how many consumers resolve this provider." : "Every request opens fresh database/Redis connections. Postgres defaults to 100 connections, so traffic exhausts the pool and requests start timing out.",
             suggestedFix: uncertain ? "Review the provider registration and scope before changing client initialization." : transient ? "Prefer a shared connection provider when appropriate; inspect consumer scope before changing this lifetime." : "Create the client once at module scope and reuse it, or inject it as a singleton.",
-            snippet: snippetAt(content, ln),
+            snippet: sourceSnippetAt(sf, line),
           }),
         );
       }
     }
   }
-  ts.forEachChild(node, (c) => visit(c, sf, content, rel, requestPath, out, lifetimes, request));
+  ts.forEachChild(node, (c) => visit(c, sf, rel, requestPath, out, lifetimes, request));
 }
 
 /**
@@ -139,12 +143,17 @@ function isInsideFunction(node: ts.Node): boolean {
 
 /** Suppress only guards on a shared module binding, not a fresh request local. */
 function guardedSharedInitialization(node: ts.Node): boolean {
-  const assignment = node.parent;
+  let value = node;
+  while (value.parent && (ts.isParenthesizedExpression(value.parent) || ts.isAsExpression(value.parent)
+    || ts.isSatisfiesExpression(value.parent) || ts.isNonNullExpression(value.parent) || ts.isTypeAssertionExpression(value.parent))) value = value.parent;
+  const assignment = value.parent;
   if (!ts.isBinaryExpression(assignment) || !ts.isIdentifier(assignment.left)) return false;
   const binding = symbolOf(assignment.left);
   const declaration = binding?.valueDeclaration;
-  if (!declaration || !ts.isVariableDeclaration(declaration) || isInsideFunction(declaration)) return false;
-  if ([ts.SyntaxKind.QuestionQuestionEqualsToken, ts.SyntaxKind.BarBarEqualsToken].includes(assignment.operatorToken.kind)) return true;
+  if (!declaration || !ts.isVariableDeclaration(declaration) || isInsideFunction(declaration) || !retainsSharedBinding(declaration)) return false;
+  if ([ts.SyntaxKind.QuestionQuestionEqualsToken, ts.SyntaxKind.BarBarEqualsToken].includes(assignment.operatorToken.kind)) {
+    return !suspendsBeforeAllocation(node, node);
+  }
   if (assignment.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
   const sameBinding = (value: ts.Expression) => ts.isIdentifier(value) && symbolOf(value) === binding;
   let current: ts.Node | undefined = assignment.parent;
@@ -158,19 +167,68 @@ function guardedSharedInitialization(node: ts.Node): boolean {
       let branch: ts.Node = assignment;
       while (branch.parent !== current && branch.parent) branch = branch.parent;
       if (guarded && branch === current.thenStatement) {
-        let yieldsBeforeInitialization = false;
-        const inspect = (part: ts.Node) => {
-          if (ts.isFunctionLike(part)) return;
-          if (ts.isAwaitExpression(part) && part.getStart() < node.getStart()) yieldsBeforeInitialization = true;
-          ts.forEachChild(part, inspect);
-        };
-        inspect(current.thenStatement);
-        if (!yieldsBeforeInitialization) return true;
+        if (!suspendsBeforeAllocation(current.thenStatement, node)) return true;
       }
     }
     current = current.parent;
   }
   return false;
+}
+
+const sharedInitializationAwaits = new WeakMap<ts.Node, readonly number[]>();
+const sharedInitializationBudgets = new WeakMap<ts.SourceFile, AnalysisBudget>();
+
+/** Constructor/call arguments finish before the client exists. A suspended
+ * argument lets another request pass the same empty-binding guard. */
+function suspendsBeforeAllocation(scope: ts.Node, allocation: ts.Node): boolean {
+  let budget = sharedInitializationBudgets.get(scope.getSourceFile());
+  if (!budget) {
+    budget = new AnalysisBudget("Shared client initialization", projectWorkLimit([scope.getSourceFile()]));
+    sharedInitializationBudgets.set(scope.getSourceFile(), budget);
+  }
+  budget.take();
+  // for-await evaluates its iterable before suspending, then initializes each
+  // iteration binding after resumption (including destructuring defaults).
+  for (let parent = allocation.parent; parent && parent !== scope.parent && !ts.isFunctionLike(parent); parent = parent.parent) {
+    budget.take();
+    if (ts.isForOfStatement(parent) && parent.awaitModifier
+      && parent.initializer.pos <= allocation.pos && allocation.end <= parent.initializer.end) return true;
+  }
+  let awaits = sharedInitializationAwaits.get(scope);
+  if (!awaits) {
+    const positions: number[] = [], pending = [scope];
+    while (pending.length) {
+      budget.take();
+      const part = pending.pop()!;
+      if (ts.isFunctionLike(part)) continue;
+      if (ts.isAwaitExpression(part)) positions.push(part.pos);
+      if (ts.isForOfStatement(part) && part.awaitModifier) positions.push(part.expression.end);
+      if (ts.isIfStatement(part) || ts.isConditionalExpression(part)) {
+        const condition = ts.isIfStatement(part) ? part.expression : part.condition;
+        const truth = conditionTruth(condition, budget);
+        pending.push(condition);
+        const yes = ts.isIfStatement(part) ? part.thenStatement : part.whenTrue;
+        const no = ts.isIfStatement(part) ? part.elseStatement : part.whenFalse;
+        if (truth !== false) pending.push(yes);
+        if (truth !== true && no) pending.push(no);
+        continue;
+      }
+      if (ts.isBinaryExpression(part) && (part.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+        || part.operatorToken.kind === ts.SyntaxKind.BarBarToken)) {
+        pending.push(part.left);
+        const skipped = part.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ? false : true;
+        if (conditionTruth(part.left, budget) !== skipped) pending.push(part.right);
+        continue;
+      }
+      ts.forEachChild(part, child => { pending.push(child); });
+    }
+    positions.sort((left, right) => { budget!.take(); return left - right; });
+    awaits = positions;
+    sharedInitializationAwaits.set(scope, awaits);
+  }
+  // Only the first executed lexical await matters. Later source after the
+  // completed assignment must not invalidate an already-created client.
+  return awaits.length > 0 && awaits[0] < allocation.end;
 }
 
 /** Constructor/field initialization is per-call when the owning class is new'd

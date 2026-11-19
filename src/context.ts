@@ -1,4 +1,5 @@
 import ts from "typescript";
+import { isCommonJsRequire } from "./bindings.js";
 
 /**
  * Per-file facts that make detection precise.
@@ -112,7 +113,7 @@ function collectImports(sf: ts.SourceFile, ctx: FileContext): void {
   const visit = (node: ts.Node) => {
     if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)) {
       const call = node.initializer;
-      if (ts.isIdentifier(call.expression) && call.expression.text === "require" && call.arguments[0] && ts.isStringLiteral(call.arguments[0])) {
+      if (isCommonJsRequire(call.expression) && call.arguments[0] && ts.isStringLiteral(call.arguments[0])) {
         const spec = call.arguments[0].text;
         if (ts.isIdentifier(node.name)) add(spec, node.name.text);
         else if (ts.isObjectBindingPattern(node.name)) {

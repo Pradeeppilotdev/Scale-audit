@@ -1,7 +1,7 @@
 import { dependencies, processEvent, serviceContexts, type StartupContext } from "../serviceContext.js";
-import { isAxiosBinding, isHttpFetch } from "../bindings.js";
+import { isAxiosCall, isHttpFetch } from "../bindings.js";
 import ts from "typescript";
-import { lineOf, snippetAt, makeFinding } from "./common.js";
+import { lineOf, sourceSnippetAt, makeFinding } from "./common.js";
 import type { Finding } from "../types.js";
 import { Workspace } from "../workspace.js";
 import { detectFloatingPromises } from "./floatingPromise.js";
@@ -32,7 +32,8 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
   const contexts = serviceContexts(root, workspace);
   // Advisory evidence is scoped to the owning package and parsed source, never comments.
   for (const unit of workspace.units) {
-    if (!hasOutboundCall(unit.sf)) continue;
+    const outbound = firstOutboundCall(unit.sf);
+    if (!outbound) continue;
     const deps = dependencies(await contexts.manifest(unit));
     const hasRetry =
       RETRY_PACKAGES.some((p) => p in deps) ||
@@ -40,7 +41,7 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
 
     if (!hasRetry) {
       const anchor = unit;
-      const ln = lineOf(anchor.sf, firstOutboundCall(anchor.sf));
+      const ln = lineOf(anchor.sf, outbound);
       out.push(
         makeFinding({
           id: "no-retry-strategy",
@@ -52,7 +53,7 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
           message: "Outbound HTTP calls have no visible retry/backoff evidence in this file or its package dependencies.",
           scaleTrigger: "A transient downstream error (429, 502, socket reset) fails the user request instead of recovering.",
           suggestedFix: "For retry-safe/idempotent operations, consider bounded retries with exponential backoff and jitter; respect Retry-After for 429/503 and avoid retrying permanent failures or duplicating writes.",
-          snippet: snippetAt(anchor.content, ln),
+          snippet: sourceSnippetAt(anchor.sf, ln),
         }),
       );
     }
@@ -113,7 +114,7 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
           message: `This project has ${unprotected.length} unhandled promise finding(s) in this file without a visible startup process-level \`unhandledRejection\` handler.`,
           scaleTrigger: "One rejected promise can terminate the whole process, taking every in-flight request on that instance with it.",
           suggestedFix: "Handle failures at the call site with await/catch first. At startup, log unexpected rejections and follow an explicit shutdown/restart policy; a global listener is not a substitute for handling failures.",
-          snippet: snippetAt(anchor.content, ln),
+          snippet: sourceSnippetAt(anchor.sf, ln),
         }),
       );
     }
@@ -122,38 +123,13 @@ export async function detectReliability(root: string, ws?: Workspace): Promise<F
   return out;
 }
 
-function hasOutboundCall(sf: ts.SourceFile): boolean {
-  let found = false;
+function firstOutboundCall(sf: ts.SourceFile): ts.CallExpression | undefined {
+  let found: ts.CallExpression | undefined;
   const visit = (node: ts.Node) => {
     if (found) return;
     if (ts.isCallExpression(node)) {
       const expr = node.expression;
-      if (isHttpFetch(expr)) {
-        found = true;
-        return;
-      }
-      if (ts.isPropertyAccessExpression(expr) && isAxiosBinding(expr.expression)) {
-        found = true;
-        return;
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
-  return found;
-}
-
-function firstOutboundCall(sf: ts.SourceFile): ts.Node {
-  let found: ts.Node = sf;
-  const visit = (node: ts.Node) => {
-    if (found !== sf) return;
-    if (ts.isCallExpression(node)) {
-      const expr = node.expression;
-      if (isHttpFetch(expr)) {
-        found = node;
-        return;
-      }
-      if (ts.isPropertyAccessExpression(expr) && isAxiosBinding(expr.expression)) {
+      if (isHttpFetch(expr) || isAxiosCall(expr)) {
         found = node;
         return;
       }

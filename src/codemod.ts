@@ -1,10 +1,13 @@
-import { checkerFor, isAxiosBinding, isHttpFetch } from "./bindings.js";
+import { axiosBodyMethod, axiosDefaultsAt, axiosInstance, axiosRequestInterceptorsObserved, checkerFor, currentImportedBinding, isAxiosMethod, isHttpFetch, moduleInputsKnown, projectFor } from "./bindings.js";
+import { runtimeLoaderLookup } from "./moduleEffects.js";
 import ts from "typescript";
-import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, realpathSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, opendirSync, openSync, readSync, realpathSync, writeSync } from "node:fs";
 import path from "node:path";
-import { readRepoFileSync } from "./repoFiles.js";
+import { readRepoFileSync, repoPathExists } from "./repoFiles.js";
 import type { Finding } from "./types.js";
 import { isDbWriteCall } from "./signals.js";
+import { nativeAbortSignalUnchanged, nativeHttpGlobalsUnchanged } from "./nativeSignals.js";
+import { AnalysisBudget, AnalysisLimitError } from "./analysisBudget.js";
 
 export interface CodemodEdit {
   /** Finding this edit came from. */
@@ -60,7 +63,7 @@ interface PositionalEdit {
  * Findings only identify a line: ambiguous candidates are left for manual
  * repair. Accepted patches use AST offsets and pass syntax validation.
  */
-export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
+export function planCodemod(root: string, findings: Finding[], analyzedSources?: Iterable<ts.SourceFile>, httpContextComplete = true): CodemodPlan {
   const byFile = new Map<string, Finding[]>();
   for (const f of findings) {
     if (!PATCHABLE.has(f.id)) continue;
@@ -73,21 +76,46 @@ export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
   const manual: CodemodEdit[] = [];
   let patched = 0;
   let unpatched = 0;
+  // Other analyzed modules can replace a process-wide timeout factory too.
+  const sources = analyzedSources ? [...analyzedSources] : undefined;
+  const byName = sources && new Map(sources.map(source => [source.fileName, source]));
+  const firstProject = sources?.[0] && projectFor(sources[0]);
+  const project = firstProject && sources!.every(source => projectFor(source) === firstProject) ? firstProject : undefined;
+  const proofSources = project ? [...project.sources.values()] : sources;
+  const nativeSignal = proofSources?.every(nativeSignalAvailable);
+  const nativeHttp = httpContextComplete ? proofSources?.every(nativeHttpAvailable) : false;
 
   for (const [rel, fileFindings] of byFile) {
     // UTF-16 is auditable, but patches require UTF-8 byte-for-byte validation.
     const content = readRepoFileSync(root, rel, undefined, false);
-    const sf = content === null ? null : parse(rel, content);
+    const validated = content === null ? null : parse(rel, content);
+    const analyzed = byName?.get(rel);
+    // Planning needs the same module graph as the detector, plus a fresh
+    // syntax and content check before using offsets from that graph.
+    const sf = validated && (byName ? analyzed?.text === content ? analyzed : null : validated);
     if (content === null || !sf) {
       unpatched += fileFindings.length;
-      manual.push(...fileFindings.map((f) => manualEdit(f)));
+      for (const finding of fileFindings) manual.push(manualEdit(finding));
       continue;
     }
 
     const edits: CodemodEdit[] = [];
     const positional: PositionalEdit[] = [];
+    const positions = new Set<number>();
+    const calls = callsByLine(sf);
+    // Every supplied source was covered above. A standalone plan checks its
+    // freshly parsed file here instead of repeating a completed project proof.
+    const canAddSignal = nativeSignal ?? nativeSignalAvailable(sf);
+    const nativeMethods = nativeHttp ?? nativeHttpAvailable(sf);
+    const sourceProject = projectFor(sf);
+    const completeProject = !!sourceProject && !sourceProject.fileScoped && sourceProject === project;
+    const hasTimeoutFinding = fileFindings.some(finding => finding.id === "outbound-no-timeout");
+    const canEditHttp = nativeMethods && hasTimeoutFinding && localDependenciesAnalyzed(sf)
+      && (completeProject || byFile.size === 1 && isolatedSource(root, rel));
     for (const f of fileFindings) {
-      const edit = planEdit(sf, f);
+      let edit: Edit | null;
+      try { edit = planEdit(sf, f, calls, canAddSignal, canEditHttp); }
+      catch (error) { if (!(error instanceof AnalysisLimitError)) throw error; edit = null; }
       if (!edit) {
         unpatched++;
         manual.push(manualEdit(f));
@@ -95,27 +123,35 @@ export function planCodemod(root: string, findings: Finding[]): CodemodPlan {
       }
       // Do not duplicate an insertion for repeated findings, or compose
       // unrelated insertions at the same offset without knowing their order.
-      if (edit.edits.some((e) => positional.some((p) => p.pos === e.pos))) {
+      if (edit.edits.some((e) => positions.has(e.pos))) {
         unpatched++;
         manual.push(manualEdit(f));
         continue;
       }
-      positional.push(...edit.edits);
+      for (const insertion of edit.edits) {
+        positions.add(insertion.pos);
+        positional.push(insertion);
+      }
       edits.push({ findingId: f.id, file: rel, line: f.line, description: edit.description, safe: edit.safe });
     }
 
     if (edits.length === 0) continue;
 
-    // Apply from the end of the file backwards so earlier offsets stay valid.
-    const ordered = [...positional].sort((a, b) => b.pos - a.pos);
-    let patchedContent = content;
+    // Offsets refer to the original source. Assemble it once rather than
+    // recopying the growing file for every generated insertion.
+    const ordered = positional.sort((a, b) => a.pos - b.pos);
+    const chunks: string[] = [];
+    let cursor = 0;
     for (const e of ordered) {
-      patchedContent = patchedContent.slice(0, e.pos) + e.text + patchedContent.slice(e.pos);
+      chunks.push(content.slice(cursor, e.pos), e.text);
+      cursor = e.pos;
     }
+    chunks.push(content.slice(cursor));
+    const patchedContent = chunks.join("");
 
     if (!parse(rel, patchedContent)) {
       unpatched += edits.length;
-      manual.push(...edits.map((e) => ({ ...e, safe: false, description: "Generated patch failed syntax validation; fix this site by hand." })));
+      for (const edit of edits) manual.push({ ...edit, safe: false, description: "Generated patch failed syntax validation; fix this site by hand." });
       continue;
     }
     patched += edits.length;
@@ -205,25 +241,25 @@ interface Edit {
   edits: PositionalEdit[];
 }
 
-function planEdit(sf: ts.SourceFile, f: Finding): Edit | null {
+function planEdit(sf: ts.SourceFile, f: Finding, calls: CallIndex, nativeSignal: boolean, nativeHttp: boolean): Edit | null {
   switch (f.id) {
     case "unbounded-read":
-      return planUnboundedRead(sf, f);
+      return planUnboundedRead(sf, f, calls);
     // SQL dialect, statement boundaries and result semantics are unknown.
     case "unbounded-raw-query":
       return null;
     case "outbound-no-timeout":
-      return planOutboundTimeout(sf, f);
+      return nativeHttp ? planOutboundTimeout(sf, f, calls, nativeSignal) : null;
     case "floating-promise":
-      return planFloatingPromise(sf, f);
+      return planFloatingPromise(sf, f, calls);
     default:
       return null;
   }
 }
 
 /** `findMany()` -> `findMany({ take: 50 })`; `findMany({ where })` -> `findMany({ take: 50, where })`. */
-function planUnboundedRead(sf: ts.SourceFile, f: Finding): Edit | null {
-  const call = findCallAtLine(sf, f.line, isCollectionRead);
+function planUnboundedRead(sf: ts.SourceFile, f: Finding, calls: CallIndex): Edit | null {
+  const call = findCallAtLine(calls, f.line, isCollectionRead);
   if (!call) return null;
   const method = (call.expression as ts.PropertyAccessExpression).name.getText();
   if (!/^(findMany|findAll)$/.test(method)) return null;
@@ -253,18 +289,18 @@ function planUnboundedRead(sf: ts.SourceFile, f: Finding): Edit | null {
 
 
 /** Add a timeout to an outbound call. */
-function planOutboundTimeout(sf: ts.SourceFile, f: Finding): Edit | null {
-  const call = findCallAtLine(sf, f.line, isOutboundCall);
+function planOutboundTimeout(sf: ts.SourceFile, f: Finding, calls: CallIndex, nativeSignal: boolean): Edit | null {
+  const call = findCallAtLine(calls, f.line, isOutboundCall);
   if (!call || call.arguments.some(ts.isSpreadElement) || call.questionDotToken) return null;
 
   const expr = call.expression;
   const isFetch = isHttpFetch(expr);
-  const isAxios = ts.isPropertyAccessExpression(expr) && isAxiosBinding(expr.expression);
+  const isAxios = (ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)) && isAxiosMethod(expr);
   if (!isFetch && !isAxios) return null;
 
   if (isFetch) {
     // Generated code must not accidentally call a user-defined AbortSignal.
-    if (checkerFor(sf).getSymbolsInScope(call, ts.SymbolFlags.Value).some(symbol => symbol.name === "AbortSignal")) return null;
+    if (!nativeSignal || checkerFor(sf).resolveName("AbortSignal", call, ts.SymbolFlags.Value, false)) return null;
     if (call.arguments.length === 0 || call.arguments.length > 2) return null;
     // A Request input can carry its own cancellation signal. Only inputs
     // known to produce strings can safely receive a new signal without
@@ -291,9 +327,9 @@ function planOutboundTimeout(sf: ts.SourceFile, f: Finding): Edit | null {
   }
 
   // axios: get(url, config) vs post(url, data, config)
-  const method = (expr as ts.PropertyAccessExpression).name.getText();
-  const hasBody = method === "post" || method === "put" || method === "patch";
-  if (!/^(get|post|put|delete|patch|head|options|request)$/.test(method)) return null;
+  const binding = currentImportedBinding(expr);
+  if (!binding || axiosInstance(binding) || axiosDefaultsAt(binding, call).changed || axiosRequestInterceptorsObserved(binding, call)) return null;
+  const method = binding.name, hasBody = axiosBodyMethod(method);
   const configIndex = method === "request" ? 0 : hasBody ? 2 : 1;
   if (call.arguments.length === 0 || call.arguments.length > configIndex + 1) return null;
   const config = call.arguments[configIndex];
@@ -316,9 +352,19 @@ function planOutboundTimeout(sf: ts.SourceFile, f: Finding): Edit | null {
   };
 }
 
+/** A single-file detector finding can already be ineligible for edits, e.g.
+ * an opaque config, an existing signal or an unsupported http.request. */
+export function hasHttpEditCandidate(sf: ts.SourceFile, findings: readonly Finding[]): boolean {
+  const local = findings.filter(f => f.id === "outbound-no-timeout" && f.file === sf.fileName);
+  if (!local.length || !nativeHttpAvailable(sf)) return false;
+  const calls = callsByLine(sf), signal = nativeSignalAvailable(sf);
+  try { return local.some(f => !!planOutboundTimeout(sf, f, calls, signal)); }
+  catch (error) { if (error instanceof AnalysisLimitError) return false; throw error; }
+}
+
 /** `db.user.create(x)` -> `await db.user.create(x)`. */
-function planFloatingPromise(sf: ts.SourceFile, f: Finding): Edit | null {
-  const call = findCallAtLine(sf, f.line, isWriteCall);
+function planFloatingPromise(sf: ts.SourceFile, f: Finding, calls: CallIndex): Edit | null {
+  const call = findCallAtLine(calls, f.line, isWriteCall);
   if (!call || !ts.isExpressionStatement(call.parent) || call.parent.expression !== call) return null;
   // Await belongs to the nearest function, not an outer async callback.
   let owner: ts.Node | undefined = call.parent;
@@ -337,20 +383,28 @@ function planFloatingPromise(sf: ts.SourceFile, f: Finding): Edit | null {
 // ---------------------------------------------------------------------------
 // AST helpers
 
-function findCallAtLine(sf: ts.SourceFile, line: number, predicate: (call: ts.CallExpression) => boolean): ts.CallExpression | null {
-  const candidates: ts.CallExpression[] = [];
-  const visit = (node: ts.Node) => {
+type CallIndex = ReadonlyMap<number, ts.CallExpression | null>;
+
+function callsByLine(sf: ts.SourceFile): CallIndex {
+  const calls = new Map<number, ts.CallExpression | null>();
+  const pending: ts.Node[] = [sf];
+  while (pending.length) {
+    const node = pending.pop()!;
     if (ts.isCallExpression(node)) {
-      const ln = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
-      if (ln === line) candidates.push(node);
+      const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+      calls.set(line, calls.has(line) ? null : node);
     }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
+    ts.forEachChild(node, child => { pending.push(child); });
+  }
+  return calls;
+}
+
+function findCallAtLine(calls: CallIndex, line: number, predicate: (call: ts.CallExpression) => boolean): ts.CallExpression | null {
   // Include unsupported calls: the line-only finding could refer to one of
   // those rather than the call we know how to patch. Helper calls on the same
   // line are conservatively manual too, until findings carry exact offsets.
-  return candidates.length === 1 && predicate(candidates[0]) ? candidates[0] : null;
+  const call = calls.get(line);
+  return call && predicate(call) ? call : null;
 }
 
 function isCollectionRead(call: ts.CallExpression): boolean {
@@ -362,14 +416,55 @@ function isCollectionRead(call: ts.CallExpression): boolean {
 
 function isOutboundCall(call: ts.CallExpression): boolean {
   const expr = call.expression;
-  if (isHttpFetch(expr)) return true;
-  if (ts.isIdentifier(expr)) return false;
-  if (ts.isPropertyAccessExpression(expr)) {
-    const recv = expr.expression.getText();
-    const method = expr.name.getText();
-    return isAxiosBinding(expr.expression) && /^(get|post|put|delete|patch|head|options|request)$/.test(method);
+  return isHttpFetch(expr) || (ts.isPropertyAccessExpression(expr) || ts.isElementAccessExpression(expr)) && isAxiosMethod(expr);
+}
+
+function localDependenciesAnalyzed(sf: ts.SourceFile): boolean {
+  try {
+    return projectFor(sf) ? moduleInputsKnown(sf) : standaloneInputsKnown(sf);
+  } catch (error) { if (error instanceof AnalysisLimitError) return false; throw error; }
+}
+function standaloneInputsKnown(sf: ts.SourceFile): boolean {
+  const budget = new AnalysisBudget("Standalone HTTP context");
+  const loader = runtimeLoaderLookup(budget);
+  const pending: ts.Node[] = [sf];
+  while (pending.length) {
+    budget.take();
+    const node = pending.pop()!;
+    const runtimeLoad = ts.isCallExpression(node) && node.arguments.length > 0
+      ? node.expression.kind === ts.SyntaxKind.ImportKeyword ? "here" : loader(node.expression) : undefined;
+    if (runtimeLoad === "unknown") return false;
+    const specifier = (ts.isImportDeclaration(node) && !node.importClause?.isTypeOnly || ts.isExportDeclaration(node) && !node.isTypeOnly)
+      ? node.moduleSpecifier : ts.isImportEqualsDeclaration(node) && !node.isTypeOnly && ts.isExternalModuleReference(node.moduleReference)
+        ? node.moduleReference.expression : ts.isCallExpression(node) && runtimeLoad ? node.arguments[0] : undefined;
+    if (specifier && (!ts.isStringLiteralLike(specifier) || /^(?:[.#/]|file:)/.test(specifier.text))) return false;
+    ts.forEachChild(node, child => { pending.push(child); });
   }
-  return false;
+  return true;
+}
+
+/** Without analyzed project sources, prove a single-source tree or leave the
+ * edit manual. Inspect only the target's ancestor directories. Another branch
+ * could contain an entry that reconfigures this client's defaults or methods. */
+function isolatedSource(root: string, rel: string): boolean {
+  const parts = rel.split("/"), budget = new AnalysisBudget("Standalone HTTP context");
+  let directory = "";
+  try {
+    for (const part of parts) {
+      budget.take();
+      if (directory && !repoPathExists(root, directory, true)) return false;
+      const handle = opendirSync(path.join(root, directory));
+      try {
+        for (let entry = handle.readSync(); entry; entry = handle.readSync()) {
+          budget.take();
+          if (entry.name === part || entry.name === ".git" || entry.name === "node_modules") continue;
+          if (entry.isDirectory() || entry.isSymbolicLink() || /\.[cm]?[jt]sx?$/i.test(entry.name)) return false;
+        }
+      } finally { handle.closeSync(); }
+      directory = path.posix.join(directory, part);
+    }
+    return true;
+  } catch { return false; }
 }
 
 function isWriteCall(call: ts.CallExpression): boolean {
@@ -412,8 +507,21 @@ function extensibleConfig(config: ts.ObjectLiteralExpression, reserved: string[]
   return config.properties.every((p) => {
     if (ts.isSpreadAssignment(p) || !p.name || ts.isComputedPropertyName(p.name)) return false;
     const name = ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) || ts.isNumericLiteral(p.name) ? p.name.text : null;
-    return name !== null && !reserved.includes(name);
+    // The special literal key can install inherited cancellation/options.
+    return name !== null && name !== "__proto__" && !reserved.includes(name);
   });
+}
+
+/** Exhausted proof leaves a patch manual. The detector retains its failure in
+ * the report; requesting a diff must not discard an incomplete audit. */
+function nativeSignalAvailable(sf: ts.SourceFile): boolean {
+  try { return nativeAbortSignalUnchanged(sf); }
+  catch (error) { if (error instanceof AnalysisLimitError) return false; throw error; }
+}
+
+function nativeHttpAvailable(sf: ts.SourceFile): boolean {
+  try { return nativeHttpGlobalsUnchanged(sf); }
+  catch (error) { if (error instanceof AnalysisLimitError) return false; throw error; }
 }
 
 /**
